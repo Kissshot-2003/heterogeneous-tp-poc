@@ -148,10 +148,10 @@ M2b 通过：smoke compute pass (data[i]+=1)。
 === 结果 ===
 dims: M=64 K=256 N=128 (每半 64 列)
 cpu_matmul_us   = 165
-h2d_transfer_us = 49
-gpu_matmul_us   = 279
-d2h_transfer_us = 107
-total_us        = 888
+h2d_transfer_us = 50
+gpu_matmul_us   = 316
+d2h_transfer_us = 132
+total_us        = 1011
 max_abs_error   = 0.000e0
 M3/M4 通过：列切分 + gather 结果与 dense 参考一致 (err < 1e-4)。
 ```
@@ -226,22 +226,24 @@ for i in 0..rows {
 
 ## 8. 性能数据与解读
 
-**3 次热启动采样（重复运行 release 二进制，排除首次编译开销）：**
+**5 次热启动采样（重复运行 release 二进制，排除首次编译开销）：**
 
 | 阶段 | 范围（µs） | 典型值 |
 |------|-----------|--------|
-| CPU matmul（算左半） | 164 ~ 205 | 165 |
-| H2D 传输 | 47 ~ 61 | 49 |
-| GPU matmul（算右半） | 277 ~ 323 | 279 |
-| D2H 传输 | 106 ~ 142 | 107 |
-| **端到端 total** | **877 ~ 1087** | 888 |
+| CPU matmul（算左半） | 164 ~ 377 | 165 |
+| H2D 传输 | 48 ~ 72 | 50 |
+| GPU matmul（算右半） | 300 ~ 378 | 316 |
+| D2H 传输 | 108 ~ 150 | 132 |
+| **端到端 total** | **899 ~ 1415** | 1011 |
 | `max_abs_error` | 0 | 0 |
 
-⚠️ **冷启动陷阱**：首次运行时 `gpu_matmul_us` 曾达到 1107~1845µs，因为 shader 编译、pipeline/buffer 创建被计入了 GPU 阶段计时。热启动稳定在 277~323µs。之前"GPU 比 CPU 慢 4 倍"的说法来自冷启动值，**不代表稳态性能**。对比性能前务必预热。
+（CPU 的 377µs 与 total 的 1415µs 来自第 2 次采样的系统调度抖动；其余 4 次 CPU 在 164~190µs。）
+
+⚠️ **冷启动陷阱**：首次运行时 `gpu_matmul_us` 曾达到 1107~1845µs，因为 shader 编译、pipeline/buffer 创建被计入了 GPU 阶段计时。热启动稳定在 300~378µs。之前"GPU 比 CPU 慢 4 倍"的说法来自冷启动值，**不代表稳态性能**。对比性能前务必预热。
 
 解读：
 
-- **稳态下 GPU 仍略慢于 CPU**：277~323µs vs 164~205µs。WGSL shader 是朴素实现——每输出元素一线程、串行累加 K=256、无 tiling/shared memory、workgroup 仅 8×8。
+- **稳态下 GPU 仍略慢于 CPU**：300~378µs vs 164~190µs（排除抖动）。WGSL shader 是朴素实现——每输出元素一线程、串行累加 K=256、无 tiling/shared memory、workgroup 仅 8×8。
 - **传输占比不低但非主导**：H2D 47~61µs + D2H 106~142µs。当前形状小（A=64×256、B1=256×64、C1=64×64，约 48KB），传输还未放大成瓶颈。
 - **`total_us` 大于各阶段之和**：total 从 CPU matmul 开始计时，包含 `gpu_matmul()` 内的一次性初始化、gather 与 dense 参考计算。**不要直接相加各阶段来核对 total**。
 - **结论**：当前版本没有净性能收益——纯 CPU 算全量约 330~410µs（两倍于左半），异构方案 877~1087µs。这**不是 PoC 失败**：PoC 验证的是通信域可行性。性能优化见 P0/P1。

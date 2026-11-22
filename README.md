@@ -25,10 +25,10 @@ M2b 通过：smoke compute pass (data[i]+=1)。
 === 结果 ===
 dims: M=64 K=256 N=128 (每半 64 列)
 cpu_matmul_us    =  165
-h2d_transfer_us  =  49    # A, B1 上传
-gpu_matmul_us    =  279
-d2h_transfer_us  =  107   # C1 回传
-total_us         =  888
+h2d_transfer_us  =  50    # A, B1 上传
+gpu_matmul_us    =  316
+d2h_transfer_us  =  132   # C1 回传
+total_us         =  1011
 max_abs_error    =  0.000e0   # vs dense reference  (< 1e-4 => PASS)
 ```
 
