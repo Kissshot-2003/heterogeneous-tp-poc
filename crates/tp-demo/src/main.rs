@@ -35,6 +35,12 @@ fn main() {
         "gpu_wall_us      = {}   (submit→collect，含 CPU 并行)",
         r.gpu_wall_us
     );
+    println!(
+        "gpu_compute_us   = {}   (P2 timestamp query 纯 GPU 时间)",
+        r.gpu_compute_us
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "N/A (不支持 TIMESTAMP_QUERY)".to_string())
+    );
     println!("d2h_transfer_us  = {}", r.d2h_transfer_us);
     println!("total_us         = {}", r.total_us);
     println!("overlap_saving_us= {}", r.overlap_saving_us);

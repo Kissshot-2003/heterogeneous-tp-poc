@@ -248,6 +248,25 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 ⚠️ **冷启动陷阱**：首次运行时 GPU 阶段曾达到 1107~1845µs，因为 shader 编译、pipeline/buffer 创建被计入计时。热启动稳定在 357~510µs。对比性能前务必预热。
 
+### P2 决定性发现：GPU 计算只占墙钟的 12%
+
+用 wgpu timestamp query 分离纯 GPU 时间后，8 次采样得到：
+
+| 指标 | 值 |
+|------|-----|
+| **纯 GPU compute（timestamp）** | **34µs（8 次完全一致）** |
+| GPU 阶段墙钟（submit→collect） | 289~474µs（偶发抖动到 8.7ms） |
+| CPU matmul | 161~582µs |
+| 提交/同步开销（wall − compute） | **约 266µs，占墙钟 88%** |
+
+**这解释了此前所有现象**：
+
+- P1 tiling 收益不可见：真实 GPU 计算只有 34µs，优化它省下的几 µs 对 ~300µs 墙钟毫无影响。
+- GPU 本身比 CPU 快 **5~10 倍**（34µs vs 161~582µs）——异构计算的算力优势是真实存在的。
+- **真正的瓶颈不是 shader，而是 wgpu/Vulkan 的提交与同步开销**：`queue.write_buffer` × 3、`queue.submit`、`device.poll(wait_indefinitely)` 用于 barrier、staging buffer 的 map/unmap——这些固定成本约 266µs，完全吞噬了 GPU 的速度优势。
+
+**优化方向随之改变**：继续调 tiling 是盲调；应减少 submit / poll / buffer 创建次数（批处理、复用 staging buffer、避免显式 barrier），或用更轻量的同步原语。
+
 解读：
 
 - **CPU 时间被 GPU 完全隐藏**：P0 后 CPU 的 161~314µs 发生在 GPU 执行窗口内，`overlap_saving_us` 直接量化了这部分收益。barrier 只等待 `max(0, T_GPU − T_CPU)` 的剩余时间。
@@ -288,11 +307,18 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 - **TILE 对比**：实测 TILE=16 优于 TILE=8（barrier 次数减半），已固定 16
 - **大形状验证（M=256,K=512,N=512）**：GPU 仍慢于 CPU（~3900µs vs ~3100µs），RX 5700 XT + 朴素 shader 难超越现代 CPU 的 naive matmul；但异构端到端 4800µs < 纯 CPU 全量 6200µs（P0 重叠收益在大规模下依然成立）
 
-### P2：更大形状 / 更优 shader（合并推进）
+### P2：timestamp query 精确测量 ✅ 已完成（见第 8 节决定性发现）
 
-- 当前形状（64×256×128）太小，shader 编译开销主导端到端时间，优化执行收益不可见
-- 真实推理引擎里 shader 编译一次后复用，P1 的 tiling 才有意义；本 PoC 每次 `cargo run` 重编译，掩盖了收益
-- 若要继续：试 cuBLAS 级优化 / 用 wgpu timestamp query 分离纯 GPU 时间 / 或换更大形状做长期 benchmark
+- device 按需请求 `Features::TIMESTAMP_QUERY`（不支持则指标显示 N/A）
+- compute pass 写入起止 timestamp，resolve 后读回，`gpu_compute_us` 进入 `PocResult`
+- **结论**：纯 GPU 计算仅 34µs，提交/同步开销 ~266µs 占墙钟 88%——瓶颈转移，后续优化应针对提交/同步而非 shader
+
+### P2b：减少提交与同步开销（新的最高优先级）
+
+- 复用 staging buffer，避免每次 D2H 都 `create_buffer`
+- 合并 H2D / compute / D2H 到更少的 submit，或探索 callback/event 替代 `poll(wait_indefinitely)`
+- 目标：把 ~266µs 固定开销压下来，让 34µs 的 GPU 优势真正体现在端到端
+- 注意坑 5：省掉 barrier 会触发 `map_async + poll` 的 ~1.7ms 异常延迟，需要在减少 submit 的同时规避它
 
 ### P3：接入 oneDNN
 

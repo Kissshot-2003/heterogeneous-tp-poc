@@ -19,10 +19,19 @@ pub struct VulkanComm {
 
 impl VulkanComm {
     /// 从已枚举的 Vulkan adapter 创建 device/queue。
+    ///
+    /// 若 adapter 支持 `TIMESTAMP_QUERY` 则一并请求，供 P2 精确测量纯 GPU 时间；
+    /// 不支持时退化为普通 device（P2 指标显示为不可用）。
     pub async fn new(adapter: &wgpu::Adapter) -> Self {
+        let features = if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("het-comm device"),
+                required_features: features,
                 ..Default::default()
             })
             .await

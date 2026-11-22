@@ -38,6 +38,8 @@ pub struct PocResult {
     pub cpu_matmul_us: u128,
     /// GPU 阶段墙钟：从 submit 到 collect 完成（期间 CPU 并行计算）
     pub gpu_wall_us: u128,
+    /// P2：timestamp query 测得的纯 GPU compute 时间（µs）；不支持时为 None
+    pub gpu_compute_us: Option<u128>,
     /// D2H 读回耗时（含等待 GPU compute 完成的 poll 时间）
     pub d2h_transfer_us: u128,
     /// 端到端墙钟
@@ -52,6 +54,15 @@ pub struct PocResult {
 /// 由 wgpu 内部保持存活直到命令完成，Rust 侧 drop 不会取消已提交的工作。
 pub struct PendingGpuMatmul {
     c_buf: TensorBuf,
+    /// P2 timestamp 测量的待读取句柄；设备不支持时为 None
+    timestamp: Option<TimestampGuard>,
+}
+
+/// P2：保存 timestamp query 的 resolve buffer 与时间戳周期，供 submit 后读取。
+pub struct TimestampGuard {
+    _query_set: wgpu::QuerySet,
+    resolve_buf: wgpu::Buffer,
+    period: f32,
 }
 
 /// 提交阶段：创建资源 + H2D + submit compute，**立即返回，不等待 GPU**。
@@ -79,6 +90,32 @@ pub fn gpu_matmul_submit(
         compilation_options: Default::default(),
         cache: None,
     });
+
+    // --- P2：创建 timestamp query 资源（若设备支持）---
+    let timestamp = if comm
+        .device
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY)
+    {
+        let query_set = comm.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("matmul timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve_buf = comm.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("timestamp resolve"),
+            size: 16, // 2 × QUERY_SIZE(8)
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Some(TimestampGuard {
+            _query_set: query_set,
+            resolve_buf,
+            period: comm.queue.get_timestamp_period(),
+        })
+    } else {
+        None
+    };
 
     let mut a_buf = het_comm::make_gpu_buffer(&comm.device, a.len());
     let mut b_buf = het_comm::make_gpu_buffer(&comm.device, b1.len());
@@ -145,9 +182,15 @@ pub fn gpu_matmul_submit(
         label: Some("matmul encoder"),
     });
     {
+        // P2：把 pass 起止时间戳写入 query set
+        let timestamp_writes = timestamp.as_ref().map(|g| wgpu::ComputePassTimestampWrites {
+            query_set: &g._query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("matmul pass"),
-            timestamp_writes: None,
+            timestamp_writes,
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
@@ -155,12 +198,23 @@ pub fn gpu_matmul_submit(
         // 实测 TILE=16 优于 TILE=8（barrier 次数减半），故固定为 16。
         pass.dispatch_workgroups(((m + 15) / 16) as u32, ((n2 + 15) / 16) as u32, 1);
     }
+
+    // P2：把 query 结果 resolve 到 buffer（与 compute 同一次 submit，顺序保证）
+    if let Some(g) = &timestamp {
+        encoder.resolve_query_set(&g._query_set, 0..2, &g.resolve_buf, 0);
+    }
     comm.queue.submit(Some(encoder.finish()));
 
-    (PendingGpuMatmul { c_buf }, h2d_us)
+    (
+        PendingGpuMatmul {
+            c_buf,
+            timestamp,
+        },
+        h2d_us,
+    )
 }
 
-/// 取回阶段：D2H 读回 C1。
+/// 取回阶段：D2H 读回 C1，并原样返回 timestamp 句柄供后续读取。
 ///
 /// `device_to_host` 内部会 submit 一个 staging copy 并 `poll(wait_indefinitely)`，
 /// 因此会自动等待先前提交的 compute 完成——无需显式 barrier。
@@ -168,7 +222,7 @@ pub fn gpu_matmul_collect(
     comm: &VulkanComm,
     pending: PendingGpuMatmul,
     len: usize,
-) -> (Vec<f32>, u128) {
+) -> (Vec<f32>, u128, Option<TimestampGuard>) {
     let t = Instant::now();
     let mut c1_buf = TensorBuf::Cpu(vec![0.0; len]);
     comm.copy(&pending.c_buf, &mut c1_buf, len);
@@ -177,7 +231,41 @@ pub fn gpu_matmul_collect(
         TensorBuf::Cpu(v) => v,
         TensorBuf::Gpu(_) => unreachable!(),
     };
-    (c1, d2h_us)
+    (c1, d2h_us, pending.timestamp)
+}
+
+/// P2：读取 timestamp query，返回纯 GPU compute 时间（µs）。
+///
+/// 在 `gpu_wall_us` 测完后再调用，避免把 timestamp 读回开销算进 GPU 墙钟。
+pub fn read_gpu_timestamps(comm: &VulkanComm, guard: Option<TimestampGuard>) -> Option<u128> {
+    let guard = guard?;
+
+    let staging = comm.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("timestamp readback"),
+        size: 16,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = comm.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("timestamp copy"),
+    });
+    encoder.copy_buffer_to_buffer(&guard.resolve_buf, 0, &staging, 0, 16);
+    comm.queue.submit(Some(encoder.finish()));
+
+    staging
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |_| {});
+    let _ = comm.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let view = staging
+        .get_mapped_range(..)
+        .expect("timestamp readback 映射失败");
+    let ticks: &[u64] = bytemuck::cast_slice(&view[..]);
+    let elapsed_ns = ticks[1].wrapping_sub(ticks[0]) as f64 * guard.period as f64;
+    drop(view);
+    staging.unmap();
+
+    Some((elapsed_ns / 1000.0) as u128)
 }
 
 /// M2b：验证 shader 编译 / pipeline / bind group / dispatch 全链路。
@@ -309,8 +397,10 @@ pub fn run_poc() -> PocResult {
     //    map_async + poll 直接等待在途 compute，D2H 会出现 ~1.7ms 的异常延迟
     //    （wgpu Vulkan 后端行为）。先 barrier 再 collect，D2H 回落到 ~150µs。
     comm.barrier();
-    let (c1, d2h_us) = gpu_matmul_collect(&comm, pending, m * n2);
+    let (c1, d2h_us, ts_guard) = gpu_matmul_collect(&comm, pending, m * n2);
+    // 先测 GPU 墙钟，再读 timestamp（读回本身会产生额外 submit/poll）
     let gpu_wall_us = gpu_wall_start.elapsed().as_micros();
+    let gpu_compute_us = read_gpu_timestamps(&comm, ts_guard);
 
     // 4) Gather：按行交错拼成完整 [M, N]（见 HANDOVER.md 坑 3）。
     let parts = [TensorBuf::Cpu(c0), TensorBuf::Cpu(c1)];
@@ -341,6 +431,7 @@ pub fn run_poc() -> PocResult {
         h2d_submit_us: h2d_us,
         cpu_matmul_us: cpu_us,
         gpu_wall_us,
+        gpu_compute_us,
         d2h_transfer_us: d2h_us,
         total_us,
         overlap_saving_us,
