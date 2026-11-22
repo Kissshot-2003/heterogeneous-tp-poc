@@ -21,17 +21,24 @@ fn main() {
         if r.smoke_compute_ok { "通过" } else { "失败" }
     );
 
-    println!("\n=== 结果 ===");
+    println!("\n=== 结果（P0：CPU 与 GPU 重叠）===");
     println!(
         "dims: M={} K={} N={} (每半 {} 列)",
         DEFAULT_M, DEFAULT_K, DEFAULT_N, DEFAULT_N / 2
     );
-    println!("cpu_matmul_us   = {}", r.cpu_matmul_us);
-    println!("h2d_transfer_us = {}", r.h2d_transfer_us);
-    println!("gpu_matmul_us   = {}", r.gpu_matmul_us);
-    println!("d2h_transfer_us = {}", r.d2h_transfer_us);
-    println!("total_us        = {}", r.total_us);
-    println!("max_abs_error   = {:.3e}", r.max_abs_error);
+    println!("h2d_submit_us    = {}", r.h2d_submit_us);
+    println!(
+        "cpu_matmul_us    = {}   (与 GPU 执行重叠)",
+        r.cpu_matmul_us
+    );
+    println!(
+        "gpu_wall_us      = {}   (submit→collect，含 CPU 并行)",
+        r.gpu_wall_us
+    );
+    println!("d2h_transfer_us  = {}", r.d2h_transfer_us);
+    println!("total_us         = {}", r.total_us);
+    println!("overlap_saving_us= {}", r.overlap_saving_us);
+    println!("max_abs_error    = {:.3e}", r.max_abs_error);
 
     assert!(r.h2d_roundtrip_ok, "M2a 失败：H2D→D2H 回环不一致");
     assert!(r.smoke_compute_ok, "M2b 失败：smoke compute pass 结果不符");

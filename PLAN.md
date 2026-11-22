@@ -57,7 +57,7 @@
 | 实现语言 | Rust | 工具链现成；本机有 Rust 项目经验（candle 相关）；无需 C++ 编译器 |
 | GPU API | wgpu 30，强制 Vulkan backend | 本地缓存有 wgpu 30；可直接枚举 AMD 设备；抽象层薄，够用 |
 | Shader 语言 | WGSL（naga → SPIR-V） | **无需 Vulkan SDK / glslc**；wgpu 原生支持 |
-| 同步方式 | `queue.submit` + `device.poll(Wait)` + `map_async` | PoC 阶段同步阻塞最稳；异步重叠留到 M4 之后 |
+| 同步方式 | submit 立即返回 + 显式 barrier + `map_async` | P0 已实现 CPU/GPU 重叠，barrier 只等待剩余时间 |
 | CPU matmul | Rust naive（三层循环 + 分块预留） | 先验证通信域，性能不是 PoC 目标；后续 FFI 换 oneDNN |
 | 数据布局 | `f32` 行主序，连续内存 | 简化传输与比对；避免 stride 坑 |
 
@@ -128,7 +128,7 @@ pub trait CommDomain {
 
 1. **trait 是边界**：上层 TP 逻辑只依赖 `CommDomain`，不直接碰 wgpu。后续接 oneDNN 或换后端，只改实现。
 2. **`TensorBuf` 是统一货币**：计算和传输都以它为输入输出，避免各模块自己管内存。
-3. **PoC 先同步**：`barrier` 用阻塞等待，正确性优先；异步重叠是后续优化项。
+3. **同步点显式化**：submit 后立即返回让 CPU 计算与 GPU 重叠，最后显式 barrier 等待剩余时间（P0 已实现）。注意 collect 前不能省 barrier，否则 `map_async + poll` 有 ~1.7ms 异常延迟。
 
 ### 4.3 数据流（TP 列切分）
 
@@ -201,7 +201,7 @@ CPU: C0 = A × B0                          H2D: A, B1 → GPU
 
 ## 7. 验收标准
 
-PoC 通过必须同时满足（**已固化为 `cargo test --offline --workspace` 的 4 个自动化测试**，见 `crates/tp-demo/tests/poc.rs`）：
+PoC 通过必须同时满足（**已固化为 `cargo test --offline --workspace` 的 5 个自动化测试**，见 `crates/tp-demo/tests/poc.rs`）：
 
 1. **后端正确**：`adapter.get_info().backend == Backends::VULKAN`；具体型号 AMD Radeon RX 5700 XT 由人工确认（测试不断言型号以保证可移植）。
 2. **数值正确**：`max(|C[i,j] - C_dense[i,j]|) < 1e-4`，默认形状 `M=64, K=256, N=128`。
@@ -227,7 +227,7 @@ PoC 通过必须同时满足（**已固化为 `cargo test --offline --workspace`
 
 1. **接 oneDNN**：`matmul_cpu` 改为 FFI 调用 oneDNN；`CommDomain` 不变。需要先解决 C++ 工具链。
 2. **真 TP + all-reduce**：切分 `A` 与 `B`，两台设备各持有部分权重，每层末做一次 all-reduce（参考 HeteGen 的非均匀切分思路）。
-3. **异步重叠**：`barrier()` 改为 event-based，让 CPU 计算与 D2H 传输重叠（HeteGen 的核心优化）。
+3. **异步重叠** ✅ **已完成（P0）**：`gpu_matmul` 拆分为 submit / collect，CPU matmul 塞进 GPU 执行窗口；典型收益 23%。详见 HANDOVER.md 第 9 节 P0。
 4. **多 GPU 扩展**：用 `ash` 直接管理多 Vulkan 设备，探索跨厂商 P2P 是否可用。
 5. **并行范式对比**：用同一套 `CommDomain` 再实现 PP/层拆分，对比 TP 与 PP 在异构场景下的收益。
 

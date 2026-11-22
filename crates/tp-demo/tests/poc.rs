@@ -32,10 +32,31 @@ fn poc_end_to_end() {
 
     // 5. 计时字段全部产生
     assert!(r.cpu_matmul_us > 0);
-    assert!(r.h2d_transfer_us > 0);
-    assert!(r.gpu_matmul_us > 0);
+    assert!(r.h2d_submit_us > 0);
+    assert!(r.gpu_wall_us > 0);
     assert!(r.d2h_transfer_us > 0);
     assert!(r.total_us > 0);
+}
+
+/// P0 验证：CPU 计算确实被塞进 GPU 等待窗口里。
+///
+/// 断言 `overlap_saving_us > 0` 且不超过 CPU 时间本身；
+/// 这保证 submit → collect 之间确实有 CPU 工作发生（而非串行执行）。
+#[test]
+fn p0_cpu_work_overlaps_gpu_wait() {
+    let r = run_poc();
+    assert!(
+        r.overlap_saving_us > 0,
+        "P0 失败：没有观察到 CPU/GPU 重叠"
+    );
+    assert!(
+        r.overlap_saving_us <= r.cpu_matmul_us,
+        "重叠节省不应超过 CPU 计算时间本身"
+    );
+    assert!(
+        r.overlap_saving_us <= r.gpu_wall_us,
+        "重叠节省不应超过 GPU 阶段墙钟"
+    );
 }
 
 /// 坑 3 回归测试：列切分的 gather 必须按行交错，不能整块拼接。

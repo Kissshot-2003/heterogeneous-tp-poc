@@ -222,48 +222,63 @@ for i in 0..rows {
 
 切分 B 时最初用 `flat_map(move |j| b[...])`，把 `b` 移进闭包，后面 dense 参考还要用 `b`。改成显式 `for` 循环解决。
 
+### 坑 5（P0）：`map_async` + poll 等待在途 compute 有 ~1.7ms 异常延迟
+
+P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` 内部的 `map_async + poll` 顺带等待 compute 完成。实测 D2H 从 ~150µs 暴涨到 1700~2164µs（wgpu Vulkan 后端行为），端到端反而慢 2~3 倍。
+
+**修复**：CPU 计算后先 `comm.barrier()` 显式等待 compute，再 `collect`。D2H 回落到 109~175µs。这**仍是异步重叠**——CPU 工作发生在 submit 与 barrier 之间，barrier 只等待 `max(0, T_GPU − T_CPU)` 的剩余时间。
+
 ---
 
 ## 8. 性能数据与解读
 
-**5 次热启动采样（重复运行 release 二进制，排除首次编译开销）：**
+**P0 重叠版，5 次热启动采样（排除首次编译开销）：**
 
 | 阶段 | 范围（µs） | 典型值 |
 |------|-----------|--------|
-| CPU matmul（算左半） | 164 ~ 377 | 165 |
-| H2D 传输 | 48 ~ 72 | 50 |
-| GPU matmul（算右半） | 300 ~ 378 | 316 |
-| D2H 传输 | 108 ~ 150 | 132 |
-| **端到端 total** | **899 ~ 1415** | 1011 |
+| H2D 提交 | 39 ~ 62 | 41 |
+| CPU matmul（与 GPU 重叠） | 161 ~ 314 | 161 |
+| GPU 阶段（submit→collect） | 357 ~ 510 | 392 |
+| D2H 读回 | 109 ~ 175 | 141 |
+| **端到端 total** | **725 ~ 1070** | 780 |
+| `overlap_saving_us` | 161 ~ 314 | 161 |
 | `max_abs_error` | 0 | 0 |
 
-（CPU 的 377µs 与 total 的 1415µs 来自第 2 次采样的系统调度抖动；其余 4 次 CPU 在 164~190µs。）
+对比 P0 之前的串行版：total 899~1415µs（典型 1011），**典型收益约 23%**。
 
-⚠️ **冷启动陷阱**：首次运行时 `gpu_matmul_us` 曾达到 1107~1845µs，因为 shader 编译、pipeline/buffer 创建被计入了 GPU 阶段计时。热启动稳定在 300~378µs。之前"GPU 比 CPU 慢 4 倍"的说法来自冷启动值，**不代表稳态性能**。对比性能前务必预热。
+⚠️ **冷启动陷阱**：首次运行时 GPU 阶段曾达到 1107~1845µs，因为 shader 编译、pipeline/buffer 创建被计入计时。热启动稳定在 357~510µs。对比性能前务必预热。
 
 解读：
 
-- **稳态下 GPU 仍略慢于 CPU**：300~378µs vs 164~190µs（排除抖动）。WGSL shader 是朴素实现——每输出元素一线程、串行累加 K=256、无 tiling/shared memory、workgroup 仅 8×8。
-- **传输占比不低但非主导**：H2D 47~61µs + D2H 106~142µs。当前形状小（A=64×256、B1=256×64、C1=64×64，约 48KB），传输还未放大成瓶颈。
-- **`total_us` 大于各阶段之和**：total 从 CPU matmul 开始计时，包含 `gpu_matmul()` 内的一次性初始化、gather 与 dense 参考计算。**不要直接相加各阶段来核对 total**。
-- **结论**：当前版本没有净性能收益——纯 CPU 算全量约 330~410µs（两倍于左半），异构方案 877~1087µs。这**不是 PoC 失败**：PoC 验证的是通信域可行性。性能优化见 P0/P1。
+- **CPU 时间被 GPU 完全隐藏**：P0 后 CPU 的 161~314µs 发生在 GPU 执行窗口内，`overlap_saving_us` 直接量化了这部分收益。barrier 只等待 `max(0, T_GPU − T_CPU)` 的剩余时间。
+- **GPU 仍慢于 CPU**：GPU 阶段 357~510µs vs CPU 161~314µs。WGSL shader 是朴素实现——每输出元素一线程、串行累加 K=256、无 tiling/shared memory、workgroup 仅 8×8。这是 P1 的优化目标。
+- **传输占比不低但非主导**：H2D 39~62µs + D2H 109~175µs。当前形状小（A=64×256、B1=256×64、C1=64×64，约 48KB），传输还未放大成瓶颈。
+- **`total_us` 大于各阶段之和**：total 从 GPU submit 前开始计时，包含一次性初始化、gather 与 dense 参考计算。**不要直接相加各阶段来核对 total**。
+- **结论**：P0 让异构方案从典型 1011µs 降到 780µs，但仍慢于纯 CPU 算全量（约 330~410µs）。这**不是 PoC 失败**：PoC 验证的是通信域可行性。下一步 P1（shader 优化）才有望逆转。
 
 ---
 
 ## 9. 下一步路线（按优先级）
 
-### P0：event-based 异步重叠（最高优先级，建议先做）
+### P0：event-based 异步重叠 ✅ 已完成
 
-**目标**：让 CPU 计算与 H2D/D2H 传输重叠，验证异构 TP 的核心价值主张。
+**目标**：让 CPU 计算与 GPU 执行重叠，验证异构 TP 的核心价值主张（HeteGen 的核心优化）。
 
-**为什么**：这是 HeteGen 的核心优化（论文中 317% 提升的主要来源）。当前 `barrier()` 是阻塞 poll，所有阶段串行。
+**实现**：把 `gpu_matmul` 拆成 `gpu_matmul_submit`（H2D + compute submit，**立即返回不等待**）和 `gpu_matmul_collect`（barrier + D2H），中间插入 CPU matmul。`CommDomain` 的 trait **完全不用改**——只改编排层，兑现了 trait 边界的价值。
 
-**改动范围**：集中在 `CommDomain` 的同步实现，不动上层逻辑——正好体现 trait 边界的价值。
+**实测（5 次热启动采样）**：
 
-**思路**：
-- 把 `barrier()` 改为返回 event/handle，或用 wgpu 的 `on_submitted_work_done` / `PollType::wait_for(submission_index)`
-- 让 GPU 提交后立即启动 CPU 计算，等 GPU 完成再取结果
-- 关键等式（来自 HeteGen）：`T_CPU = T_GPU + T_COM`（让 CPU 计算时间刚好覆盖 GPU 计算 + 通信）
+| 指标 | 串行版（P0 之前） | P0 重叠版 |
+|------|------------------|-----------|
+| 端到端 total | 899~1415µs（典型 1011） | 725~1070µs（典型 780） |
+| CPU matmul | 164~377µs | 161~314µs（被 GPU 执行覆盖） |
+| `overlap_saving_us` | — | 161~314µs |
+
+典型收益约 **23%**，CPU 计算时间被 GPU 完全隐藏。`max_abs_error` 仍全为 0，测试增至 5 个全绿（新增 `p0_cpu_work_overlaps_gpu_wait`）。
+
+**关键等式**（HeteGen）：`T_CPU = T_GPU + T_COM`，让 CPU 计算时间刚好覆盖 GPU 计算 + 通信。
+
+**踩坑**：collect 前的显式 `barrier()` 不能省——见坑 5。
 
 ### P1：GPU shader 优化
 

@@ -2,6 +2,9 @@
 //!
 //! 抽成 lib 是为了让 `main.rs` 和集成测试共用同一份端到端流程，
 //! 避免"测试通过但 demo 行为不同"的偏差。
+//!
+//! **P0：异步重叠** —— GPU submit 后立即返回，CPU matmul 在 GPU 执行期间
+//! 并行运行，最后统一取回。关键等式（HeteGen）：`T_CPU = T_GPU + T_COM`。
 
 pub mod dense;
 pub mod matmul_cpu;
@@ -29,30 +32,41 @@ pub struct PocResult {
     pub smoke_compute_ok: bool,
     /// M4：与 dense 参考的最大绝对误差
     pub max_abs_error: f32,
-    /// 分阶段耗时（微秒）
+    /// H2D 提交（CPU 侧 write_buffer）耗时
+    pub h2d_submit_us: u128,
+    /// CPU matmul 耗时（与 GPU 执行重叠）
     pub cpu_matmul_us: u128,
-    pub h2d_transfer_us: u128,
-    pub gpu_matmul_us: u128,
+    /// GPU 阶段墙钟：从 submit 到 collect 完成（期间 CPU 并行计算）
+    pub gpu_wall_us: u128,
+    /// D2H 读回耗时（含等待 GPU compute 完成的 poll 时间）
     pub d2h_transfer_us: u128,
+    /// 端到端墙钟
     pub total_us: u128,
+    /// 重叠节省的时间：CPU 计算被 GPU 等待覆盖的部分
+    pub overlap_saving_us: u128,
 }
 
-/// GPU 侧三个阶段耗时（微秒）。
-struct GpuTimings {
-    h2d_us: u128,
-    gpu_us: u128,
-    d2h_us: u128,
+/// 已提交到 GPU、等待取回的 matmul 任务。
+///
+/// 只需持有 C1 的 GPU buffer：其余 buffer / pipeline / bind group 在 submit 后
+/// 由 wgpu 内部保持存活直到命令完成，Rust 侧 drop 不会取消已提交的工作。
+pub struct PendingGpuMatmul {
+    c_buf: TensorBuf,
 }
 
-/// 在 GPU 上算 C1 = A × B1，返回 (C1, 分阶段耗时)。
-fn gpu_matmul(
+/// 提交阶段：创建资源 + H2D + submit compute，**立即返回，不等待 GPU**。
+///
+/// 返回 `(pending, h2d_submit_us)`。CPU 可在此之后立即开始计算 C0，
+/// 与 GPU 执行重叠；最后调用 `gpu_matmul_collect` 取回结果。
+pub fn gpu_matmul_submit(
     comm: &VulkanComm,
     a: &[f32],
     b1: &[f32],
     m: usize,
     k: usize,
     n2: usize,
-) -> (Vec<f32>, GpuTimings) {
+) -> (PendingGpuMatmul, u128) {
+    // --- 初始化（不计入 H2D 计时）---
     let module = comm.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("matmul shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/matmul.wgsl").into()),
@@ -81,11 +95,10 @@ fn gpu_matmul(
         bytemuck::cast_slice(&[m as u32, k as u32, n2 as u32, 0u32]),
     );
 
-    // --- H2D：上传 A 与 B1 ---
+    // --- H2D：上传 A 与 B1（CPU 侧 write_buffer）---
     let t = Instant::now();
     comm.copy(&TensorBuf::Cpu(a.to_vec()), &mut a_buf, a.len());
     comm.copy(&TensorBuf::Cpu(b1.to_vec()), &mut b_buf, b1.len());
-    comm.barrier();
     let h2d_us = t.elapsed().as_micros();
 
     let bind_group = comm.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -127,8 +140,7 @@ fn gpu_matmul(
         ],
     });
 
-    // --- GPU：dispatch compute shader ---
-    let t = Instant::now();
+    // --- 提交 compute（立即返回；不调用 barrier，GPU 后台执行）---
     let mut encoder = comm.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("matmul encoder"),
     });
@@ -143,27 +155,28 @@ fn gpu_matmul(
         pass.dispatch_workgroups(((m + 7) / 8) as u32, ((n2 + 7) / 8) as u32, 1);
     }
     comm.queue.submit(Some(encoder.finish()));
-    comm.barrier();
-    let gpu_us = t.elapsed().as_micros();
 
-    // --- D2H：读回 C1 ---
+    (PendingGpuMatmul { c_buf }, h2d_us)
+}
+
+/// 取回阶段：D2H 读回 C1。
+///
+/// `device_to_host` 内部会 submit 一个 staging copy 并 `poll(wait_indefinitely)`，
+/// 因此会自动等待先前提交的 compute 完成——无需显式 barrier。
+pub fn gpu_matmul_collect(
+    comm: &VulkanComm,
+    pending: PendingGpuMatmul,
+    len: usize,
+) -> (Vec<f32>, u128) {
     let t = Instant::now();
-    let mut c1_buf = TensorBuf::Cpu(vec![0.0; m * n2]);
-    comm.copy(&c_buf, &mut c1_buf, m * n2);
+    let mut c1_buf = TensorBuf::Cpu(vec![0.0; len]);
+    comm.copy(&pending.c_buf, &mut c1_buf, len);
     let d2h_us = t.elapsed().as_micros();
-
     let c1 = match c1_buf {
         TensorBuf::Cpu(v) => v,
         TensorBuf::Gpu(_) => unreachable!(),
     };
-    (
-        c1,
-        GpuTimings {
-            h2d_us,
-            gpu_us,
-            d2h_us,
-        },
-    )
+    (c1, d2h_us)
 }
 
 /// M2b：验证 shader 编译 / pipeline / bind group / dispatch 全链路。
@@ -255,7 +268,7 @@ pub fn run_poc() -> PocResult {
     };
     let smoke_compute_ok = smoke_compute(&comm);
 
-    // ===== M3：双路 matmul + 列切分合并 =====
+    // ===== M3：双路 matmul + 列切分合并（P0：CPU/GPU 重叠）=====
     let (m, k, n) = (DEFAULT_M, DEFAULT_K, DEFAULT_N);
     let n2 = n / 2;
     assert_eq!(n % 2, 0, "N 必须能被 2 整除");
@@ -279,12 +292,26 @@ pub fn run_poc() -> PocResult {
     }
 
     let total_start = Instant::now();
+
+    // 1) 提交 GPU（H2D + compute），立即返回。
+    let (pending, h2d_us) = gpu_matmul_submit(&comm, &a, &b1, m, k, n2);
+    let gpu_wall_start = Instant::now();
+
+    // 2) CPU 算左半 C0 —— 与 GPU 执行重叠。
     let t = Instant::now();
     let c0 = matmul_cpu(&a, &b0, m, k, n2);
     let cpu_us = t.elapsed().as_micros();
-    let (c1, timings) = gpu_matmul(&comm, &a, &b1, m, k, n2);
 
-    // Gather：按行交错拼成完整 [M, N]（见 HANDOVER.md 坑 3）。
+    // 3) 显式等待 GPU compute 完成（CPU 已与之重叠），再取回结果。
+    //
+    //    注意：不能省掉这个 barrier。实测若让 device_to_host 内部的
+    //    map_async + poll 直接等待在途 compute，D2H 会出现 ~1.7ms 的异常延迟
+    //    （wgpu Vulkan 后端行为）。先 barrier 再 collect，D2H 回落到 ~150µs。
+    comm.barrier();
+    let (c1, d2h_us) = gpu_matmul_collect(&comm, pending, m * n2);
+    let gpu_wall_us = gpu_wall_start.elapsed().as_micros();
+
+    // 4) Gather：按行交错拼成完整 [M, N]（见 HANDOVER.md 坑 3）。
     let parts = [TensorBuf::Cpu(c0), TensorBuf::Cpu(c1)];
     let mut gathered = TensorBuf::Cpu(Vec::with_capacity(m * n));
     comm.gather_to_cpu(&parts, &mut gathered, m, n2);
@@ -298,16 +325,23 @@ pub fn run_poc() -> PocResult {
     let dense = dense_matmul(&a, &b, m, k, n);
     let err = max_abs_error(&got, &dense);
 
+    // CPU 计算被 GPU 等待覆盖的部分：
+    // GPU 阶段（扣除 D2H）的墙钟 = CPU 时间 + barrier 剩余等待，
+    // 重叠节省 = min(CPU 时间, GPU 阶段时间)。
+    let gpu_phase_us = gpu_wall_us.saturating_sub(d2h_us);
+    let overlap_saving_us = cpu_us.min(gpu_phase_us);
+
     PocResult {
         adapter_name: info.name,
         backend: info.backend,
         h2d_roundtrip_ok,
         smoke_compute_ok,
         max_abs_error: err,
+        h2d_submit_us: h2d_us,
         cpu_matmul_us: cpu_us,
-        h2d_transfer_us: timings.h2d_us,
-        gpu_matmul_us: timings.gpu_us,
-        d2h_transfer_us: timings.d2h_us,
+        gpu_wall_us,
+        d2h_transfer_us: d2h_us,
         total_us,
+        overlap_saving_us,
     }
 }
