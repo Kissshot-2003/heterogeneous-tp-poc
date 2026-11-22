@@ -1,17 +1,17 @@
 # 异构张量并行 PoC（1 CPU + 1 Vulkan GPU）
 
-最小工具化验证：建立跨 CPU / Vulkan GPU 的统一通信域，跑通一次真实的张量并行切分。
+最小工具化验证：建立跨 CPU / Vulkan GPU 的统一通信域，跑通真正的张量并行（行并行 + all-reduce）。
 
 ## 一句话目标
 
-把一次矩阵乘法 `[M,K] × [K,N]` 按列切成两半：**CPU 算左半、GPU 算右半**，再把结果汇总回 CPU，与 dense 参考逐元素比对，并输出分阶段耗时。
+把一次矩阵乘法 `[M,K] × [K,N]` 做**行并行**切分：`A` 按列切、`B` 按行切，CPU/GPU 各持有部分权重并算出 `[M,N]` 部分和，层末 **all-reduce** 相加后与 dense 参考逐元素比对，并输出分阶段耗时。
 
 ## 快速开始
 
 ```powershell
 cd C:\通用工程\10_heterogeneous-tp-poc
 cargo run --offline -p tp-demo --release   # 跑 Demo
-cargo test --offline --workspace           # 一键回归测试（4 个测试全绿）
+cargo test --offline --workspace           # 一键回归测试（8 个测试全绿）
 ```
 
 预期输出（示意，数字为热启动典型值）：
@@ -22,15 +22,17 @@ M1 通过：Vulkan adapter 可用。
 M2a 通过：[4] 向量 H2D→D2H 回环。
 M2b 通过：smoke compute pass (data[i]+=1)。
 
-=== 结果（P0：CPU 与 GPU 重叠）===
-dims: M=64 K=256 N=128 (每半 64 列)
-h2d_submit_us     =  41
-cpu_matmul_us     =  161   (与 GPU 执行重叠)
-gpu_wall_us       =  392   (submit→collect，含 CPU 并行)
-d2h_transfer_us   =  141
-total_us          =  780
-overlap_saving_us =  161
-max_abs_error     =  0.000e0   # vs dense reference  (< 1e-4 => PASS)
+=== 结果（P4：真 TP 行并行 + all-reduce）===
+dims: M=64 K=256 N=128 | 行并行: CPU K=128 / GPU K=128 (各算 [M,N] 部分和)
+h2d_submit_us     =  46
+cpu_matmul_us     =  116   (与 GPU 执行重叠)
+gpu_wall_us       =  232   (submit→collect，含 CPU 并行)
+gpu_compute_us    =  45    (P2 timestamp query 纯 GPU 时间)
+d2h_transfer_us   =  108
+total_us          =  980
+overlap_saving_us =  116
+max_abs_error     =  1.192e-6   # vs dense reference  (< 1e-4 => PASS)
+P4 通过：行并行 + all-reduce 结果与 dense 参考一致 (err < 1e-4)。
 ```
 
 ## 当前状态
@@ -41,7 +43,7 @@ max_abs_error     =  0.000e0   # vs dense reference  (< 1e-4 => PASS)
 | M2 统一 buffer + H2D/D2H 传输 + smoke compute pass | ✅ 已通过 |
 | M3 CPU/GPU 双路 matmul + 列切分合并 | ✅ 已通过 |
 | M4 数值比对 + 计时报告 | ✅ 已通过 |
-| 自动化回归测试（5 个） | ✅ 全绿，含 gather 按行交错 + P0 重叠的回归测试 |
+| 自动化回归测试（8 个） | ✅ 全绿，含 gather 按行交错、P0 重叠、P5 GPU→GPU/all-reduce 的回归测试 |
 | P0 CPU/GPU 异步重叠 | ✅ 已完成，典型收益 23%（1011µs → 780µs） |
 | P1 shared memory tiling | ✅ 已完成，GPU 执行改善 20% 但端到端不可见 |
 | P2 timestamp query | ✅ 已完成，**纯 GPU 计算仅 34µs，88% 墙钟是提交/同步开销** |
@@ -51,9 +53,9 @@ max_abs_error     =  0.000e0   # vs dense reference  (< 1e-4 => PASS)
 | P4 真 TP + all-reduce | ✅ 已完成（达成初衷）：行并行切分 + 层末 all-reduce，误差 1.19e-6，6 个测试全绿 |
 | P5 多 GPU 通信路径 | ✅ 已完成（单卡模拟）：GPU→GPU copy + GPU 端 all-reduce（3 分片），8 个测试全绿 |
 
-**完整 PoC 已跑通**：`max_abs_error = 0.000e0`（M=64, K=256, N=128）。已 `git init`，基线提交 `836d14f`。
+**完整 PoC 已跑通**：真 TP（P4）`max_abs_error = 1.192e-6`（M=64, K=256, N=128；行并行浮点累加顺序差异，远低于 1e-4 阈值）。已 `git init`，基线提交 `836d14f`，当前 `10ffc0a`。
 
-> 注意：首次运行 GPU 阶段会包含 shader 编译开销（可达 1107µs），热启动稳定在 357~510µs；`total_us` 还包含初始化、gather 与 dense 参考计算，不要直接相加各阶段核对。详见 HANDOVER.md 第 8 节。
+> 注意：首次运行 GPU 阶段会包含 shader 编译开销（可达 1107µs），热启动稳定在 357~510µs；`total_us` 还包含初始化、all-reduce 与 dense 参考计算，不要直接相加各阶段核对。详见 HANDOVER.md 第 8 节。
 
 ## 文档
 

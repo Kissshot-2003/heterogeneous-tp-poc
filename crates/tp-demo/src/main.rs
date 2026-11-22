@@ -50,8 +50,8 @@ fn main() {
     assert!(r.smoke_compute_ok, "M2b 失败：smoke compute pass 结果不符");
     assert!(
         r.max_abs_error < 1e-4,
-        "M3/M4 失败：max_abs_error = {} >= 1e-4",
+        "P4 失败：max_abs_error = {} >= 1e-4",
         r.max_abs_error
     );
-    println!("M3/M4 通过：列切分 + gather 结果与 dense 参考一致 (err < 1e-4)。");
+    println!("P4 通过：行并行 + all-reduce 结果与 dense 参考一致 (err < 1e-4)。");
 }

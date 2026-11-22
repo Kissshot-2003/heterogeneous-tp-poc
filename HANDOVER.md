@@ -11,11 +11,11 @@
 | 项 | 内容 |
 |----|------|
 | **做了什么** | 用 Rust + wgpu 建立跨 CPU / Vulkan GPU 的统一通信域，跑通**真正的张量并行**：行并行切分（A 按列切、B 按行切），CPU/GPU 各持有部分权重并算出 `[M,N]` 部分和，层末 **all-reduce** 相加后与 dense 参考比对 |
-| **结果** | `max_abs_error = 1.192e-6`（P4 行并行，浮点累加顺序差异；远小于 1e-4 阈值），6 个测试全绿 |
+| **结果** | `max_abs_error = 1.192e-6`（P4 行并行，浮点累加顺序差异；远小于 1e-4 阈值），8 个测试全绿 |
 | **硬件** | AMD Ryzen 5 5600 + AMD Radeon RX 5700 XT（Vulkan 1.4） |
 | **技术栈** | Rust + wgpu 30（Vulkan backend）+ WGSL（naga 编译 SPIR-V） |
 | **怎么跑** | `cargo run --offline -p tp-demo --release` |
-| **怎么回归** | `cargo test --offline --workspace`（4 个测试全绿，含坑 3 的回归测试） |
+| **怎么回归** | `cargo test --offline --workspace`（8 个测试全绿，含坑 3、P0 重叠、P5 GPU→GPU/all-reduce 的回归测试） |
 | **版本控制** | 已 `git init`，基线提交 `836d14f`，改坏可回滚 |
 | **下一步** | 优先级最高的是 **P0：event-based 异步重叠**（见第 9 节） |
 
@@ -120,11 +120,11 @@
 > 详细设计与数据流图见 [PLAN.md 第 4 节](PLAN.md#4-架构设计)，这里只保留接手人必须知道的最小集合。
 
 - **`TensorBuf`**：`Cpu(Vec<f32>)` 或 `Gpu(wgpu::Buffer)`，统一 CPU/GPU 内存。
-- **`CommDomain` trait**：`copy` / `gather_to_cpu` / `barrier` 三个方法。上层只依赖它、不直接碰 wgpu——这是 P0 异步重叠能"只改实现、不动调用方"的关键。
-- **`VulkanComm`**：当前唯一实现，持有 `device`/`queue`。`copy` 自动分派 CPU→CPU / CPU→GPU（`write_buffer`）/ GPU→CPU（staging buffer）；**GPU→GPU 是 `todo!()`**，单卡 PoC 用不到。
-- **`run_poc()`**（`tp-demo/src/lib.rs`）：端到端流程，返回 `PocResult`（含 5 项耗时与误差）。`main.rs` 和集成测试共用它，避免"测试通过但 demo 行为不同"。
+- **`CommDomain` trait**：`copy` / `gather_to_cpu` / `all_reduce` / `barrier` 四个方法。上层只依赖它、不直接碰 wgpu——这是 P0 异步重叠、P4 all-reduce 能"只改实现、不动调用方"的关键。
+- **`VulkanComm`**：当前唯一实现，持有 `device`/`queue`。`copy` 自动分派 CPU→CPU / CPU→GPU（`write_buffer`）/ GPU→CPU（staging buffer）/ GPU→GPU（`device_to_device`，P5 填补）。
+- **`run_poc()`**（`tp-demo/src/lib.rs`）：端到端流程，返回 `PocResult`（含各项耗时与误差）。`main.rs` 和集成测试共用它，避免"测试通过但 demo 行为不同"。
 
-**关键边界**：当前是列切分 + gather 的**"伪 TP"，没有 all-reduce**。真正的 TP 要切分 A 和 B、各设备持有部分权重、层末 all-reduce。别把 gather 当成完整 TP 实现。
+**当前形态**：P4 起已是**真正的 TP**——行并行切分 + 层末 all-reduce。早期版本（列切分 + gather）是"伪 TP"，仅作为通信域底座验证；`gather_to_cpu` 接口保留但 demo 已不用。
 
 ---
 
@@ -145,15 +145,17 @@ M1 通过：Vulkan adapter 可用。
 M2a 通过：[4] 向量 H2D→D2H 回环。
 M2b 通过：smoke compute pass (data[i]+=1)。
 
-=== 结果 ===
-dims: M=64 K=256 N=128 (每半 64 列)
-cpu_matmul_us   = 165
-h2d_transfer_us = 50
-gpu_matmul_us   = 316
-d2h_transfer_us = 132
-total_us        = 1011
-max_abs_error   = 0.000e0
-M3/M4 通过：列切分 + gather 结果与 dense 参考一致 (err < 1e-4)。
+=== 结果（P4：真 TP 行并行 + all-reduce）===
+dims: M=64 K=256 N=128 | 行并行: CPU K=128 / GPU K=128 (各算 [M,N] 部分和)
+h2d_submit_us     = 46
+cpu_matmul_us     = 116   (与 GPU 执行重叠)
+gpu_wall_us       = 232   (submit→collect，含 CPU 并行)
+gpu_compute_us    = 45    (P2 timestamp query 纯 GPU 时间)
+d2h_transfer_us   = 108
+total_us          = 980
+overlap_saving_us = 116
+max_abs_error     = 1.192e-6
+P4 通过：行并行 + all-reduce 结果与 dense 参考一致 (err < 1e-4)。
 ```
 
 ### 6.2 一键回归测试（推荐）
@@ -385,7 +387,7 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 **结果**：5 次采样误差恒为 `1.192e-6`（浮点顺序差异，非 bug），端到端 ~980µs，CPU 121µs / GPU 45µs / 重叠仍生效。测试增至 6 个（新增 `all_reduce_sums_partials`）。
 
-**遗留**：all-reduce 目前是 CPU 侧 reduce-to-root；P5 多卡时需实现 GPU→GPU（当前 `copy` 的 GPU→GPU 分支仍是 `todo!()`）和真正的 ring/tree all-reduce。
+**遗留**：P4 demo 的 all-reduce 是 CPU 侧 reduce-to-root；GPU 端 all-reduce 由 P5 的 `GpuReducer` 补齐（见下文），但拓扑仍是 pairwise reduce + broadcast，ring/tree 优化留待真实多卡。
 
 ### P5：多 GPU 通信路径 ✅ 已完成（单卡模拟多设备）
 
@@ -405,15 +407,15 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 ## 10. 已知限制 / 不要踩的雷
 
-1. **同步阻塞**：`barrier()` 用 `device.poll(wait_indefinitely())`，正确性优先，无异步重叠。P0 要解决。
-2. **没有 all-reduce**：当前是列切分 + gather，不是真 TP。别把它当成完整的 TP 实现。
-3. **GPU→GPU 是 `todo!()`**：单 GPU PoC 用不到，多卡时必须实现。
+1. **同步仍偏阻塞**：P0 已做 submit/collect 拆分与 CPU/GPU 重叠，但 `barrier()`、D2H 的 `map_async + poll` 仍是阻塞等待；真正的 event/callback 异步尚未实现。
+2. **all-reduce 是 2 设备简化版**：P4 demo 用 CPU 侧 reduce-to-root；P5 的 `GpuReducer` 是 pairwise reduce + broadcast，**不是 ring/tree**。多卡规模化时需换拓扑算法。
+3. **GPU→GPU 走同 device 显存**：`device_to_device` 用同一 logical device 的 buffer 拷贝模拟多设备。真实跨物理卡时 wgpu 不支持跨 device 直拷，必须改走 host staging 中转。
 4. **一次性初始化未计入分阶段耗时**：`total_us` 包含 shader 编译/pipeline 创建，比较性能时别直接相加各阶段。
-5. **数值比对用 f32**：当前误差为 0，但换更大 K 或用不同累加顺序时可能到 1e-5 量级，验收阈值 1e-4 留有空间。
-6. **`gather_to_cpu` 的按行交错逻辑不要改回整块拼接**：见坑 3；已有回归测试守护。
-7. **依赖离线可复现**：用 `--offline` 时依赖必须已在本地缓存；换机器时去掉 `--offline` 让 cargo 拉取。
+5. **数值误差来自浮点顺序**：P4 行并行的部分和累加顺序与 dense 不同，误差恒为 `1.192e-6`（非 bug）。换更大 K 时可能到 1e-5 量级，验收阈值 1e-4 留有空间。
+6. **`gather_to_cpu` 的按行交错逻辑不要改回整块拼接**：见坑 3；已有回归测试守护（demo 虽已不用 gather，接口仍需保持正确）。
+7. **依赖离线可复现**：用 `--offline` 时依赖必须已在本地缓存（含 P3 新增的 rayon）；换机器时去掉 `--offline` 让 cargo 拉取。
 8. **性能对比必须先预热**：冷启动把 shader 编译计入 GPU 计时，数字会虚高 3~4 倍，不可与稳态值直接比较。
-9. **验收标准已自动化**：改完代码先跑 `cargo test --offline --workspace`，别再靠肉眼读 demo 输出判断是否回归。
+9. **验收标准已自动化**：改完代码先跑 `cargo test --offline --workspace`（8 个测试），别再靠肉眼读 demo 输出判断是否回归。
 
 ---
 
@@ -432,7 +434,7 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 ## 12. 接手人第一天清单
 
 - [ ] `git log --oneline` 确认基线提交 `836d14f`，工作区干净
-- [ ] 跑 `cargo test --offline --workspace`，确认 4 个测试全绿
+- [ ] 跑 `cargo test --offline --workspace`，确认 8 个测试全绿
 - [ ] 跑 `cargo run --offline -p tp-demo --release`，对照第 6.1 节预期输出
 - [ ] 读 `het-comm/src/lib.rs` + `domain.rs`，理解 `TensorBuf` / `CommDomain` / `VulkanComm`
 - [ ] 读 `tp-demo/src/lib.rs` 的 `run_poc()` / `gpu_matmul()`，理解 H2D→compute→D2H 流程（`main.rs` 只是打印壳）
