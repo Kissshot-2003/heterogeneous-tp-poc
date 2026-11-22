@@ -375,13 +375,7 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 **意义**：小形状 CPU 仅改善 12%（160→140µs，并行开销占比高），但**大形状 3 倍加速**，正好补上 P2c 无法解决的 CPU 瓶颈。GPU 与 CPU 速度差距从 10 倍缩小到约 2.5 倍。
 
-**oneDNN 仍未接**：本机无 oneDNN 库；若未来要接，只需替换 `matmul_cpu.rs`，通信域与上层调度不变。
-
-### P3：接入 oneDNN
-
-- 把 `matmul_cpu` 改为 FFI 调用 oneDNN
-- **前置条件**：本机需要装 C++ 工具链（VS Build Tools）+ oneDNN 库；或用 Rust 的 oneDNN binding
-- 注意 AMD CPU 上拿不到 AVX-512/AMX 红利
+**oneDNN 仍未接**：本机无 oneDNN 库；若未来要接（FFI 替换 `matmul_cpu`，通信域与上层调度不变），需先装 oneDNN 库，且 AMD CPU 上拿不到 AVX-512/AMX 红利。
 
 ### P4：真 TP + all-reduce ✅ 已完成（达成项目初衷）
 
@@ -429,7 +423,7 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 ## 11. 参考
 
-- 项目内文档：`README.md`（快速开始）、`PLAN.md`（完整方案与踩坑记录）
+- 项目内文档：`SUMMARY.md`（一页纸总结）、`README.md`（快速开始）、`PLAN.md`（完整方案与踩坑记录）
 - HeteGen, MLSys 2024 — CPU+GPU 异构 TP 与非均匀切分
 - HexGen, MLR 2024 — 异构跨数据中心 TP+PP
 - AsymGroup, IEEE Access 2025 — 按设备能力分配 2D TP

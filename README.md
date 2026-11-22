@@ -93,6 +93,7 @@ P5 4-device max_abs_error: 1.490e-6
 
 ## 文档
 
+- [SUMMARY.md](SUMMARY.md) — **一页纸总结**（结论、4 个发现、关键数据、边界；只看一页就看这个）
 - [HANDOVER.md](HANDOVER.md) — 完整交接文档（架构、全部踩坑、性能解读、路线图）
 - [PLAN.md](PLAN.md) — 项目方案（目标、API、里程碑、验收标准）
 - [BLOG.md](BLOG.md) — 社区文章底稿（结论摘要，可直接改写发布）
