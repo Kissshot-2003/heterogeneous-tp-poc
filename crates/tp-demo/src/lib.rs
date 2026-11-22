@@ -11,7 +11,7 @@ pub mod matmul_cpu;
 
 use std::time::Instant;
 
-use het_comm::{as_gpu, CommDomain, TensorBuf, VulkanComm};
+use het_comm::{as_gpu, CommDomain, GpuReducer, TensorBuf, VulkanComm};
 
 use crate::dense::{dense_matmul, max_abs_error};
 use crate::matmul_cpu::{matmul_cpu, warmup_matmul_cpu};
@@ -49,6 +49,22 @@ pub struct PocResult {
     /// P4：行并行切分的 K 维度（CPU / GPU），各算 [M,N] 部分和
     pub cpu_k: usize,
     pub gpu_k: usize,
+}
+
+/// P5：N 逻辑设备端到端 TP demo 的结果。
+#[derive(Debug, Clone)]
+pub struct MultiPocResult {
+    pub adapter_name: String,
+    /// 逻辑设备数（用 N 个独立 GPU storage buffer 模拟）
+    pub n_devices: usize,
+    /// 每个设备负责的 K 维度长度
+    pub k_per_device: usize,
+    /// 与 dense 参考的最大绝对误差
+    pub max_abs_error: f32,
+    /// GPU 端 all-reduce 结果是否与 CPU pairwise 参考一致
+    pub all_reduce_ok: bool,
+    /// 端到端墙钟（含 H2D / N 路 matmul / all-reduce / D2H）
+    pub total_us: u128,
 }
 
 /// 已提交到 GPU、等待取回的 matmul 任务。
@@ -473,5 +489,196 @@ pub fn run_poc() -> PocResult {
         overlap_saving_us,
         cpu_k,
         gpu_k,
+    }
+}
+
+/// P5：N 逻辑设备端到端张量并行（行并行 + GPU 端 all-reduce）。
+///
+/// 本机只有 1 张物理 GPU，用同一 logical device 上的 N 个独立 storage buffer
+/// 模拟 N 个逻辑设备：
+///   - K 维度切成 N 份，每个 buffer 持有 (A_i, B_i) 并算部分和 C_i = A_i × B_i
+///   - GpuReducer 对 N 个 C_i 做 GPU 端 all-reduce（pairwise add + broadcast）
+///   - 结果与 dense 参考比对
+///
+/// 通信算法（all-reduce）与真实多卡一致，物理传输走本 device 显存。
+pub fn run_poc_multi(n_devices: usize) -> MultiPocResult {
+    assert!(n_devices >= 2, "多设备 demo 至少需要 2 个逻辑设备");
+    assert_eq!(DEFAULT_K % n_devices, 0, "K 必须能被设备数整除");
+
+    let adapter = pollster::block_on(het_comm::request_vulkan_adapter());
+    let info = adapter.get_info();
+    let comm = pollster::block_on(VulkanComm::new(&adapter));
+    let reducer = GpuReducer::new(comm.device.clone(), comm.queue.clone());
+
+    let (m, k, n) = (DEFAULT_M, DEFAULT_K, DEFAULT_N);
+    let k_i = k / n_devices;
+
+    // 与单设备 demo 相同的确定性输入。
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i * 17 % 97) as f32) / 97.0 - 0.5)
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| ((i * 31 % 89) as f32) / 89.0 - 0.5)
+        .collect();
+
+    // 行并行切分：A 按列切成 N 份，B 按行切成 N 份。
+    let mut a_parts = Vec::with_capacity(n_devices);
+    let mut b_parts = Vec::with_capacity(n_devices);
+    for d in 0..n_devices {
+        let mut a_d = Vec::with_capacity(m * k_i);
+        for i in 0..m {
+            for t in 0..k_i {
+                a_d.push(a[i * k + d * k_i + t]);
+            }
+        }
+        a_parts.push(a_d);
+        b_parts.push(b[d * k_i * n..(d + 1) * k_i * n].to_vec());
+    }
+
+    let total_start = Instant::now();
+
+    // 每个逻辑设备用自己的 (A_i, B_i) 算部分和 C_i [M,N]，全部放 GPU buffer。
+    let module = comm.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("multi matmul shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/matmul.wgsl").into()),
+    });
+    let pipeline = comm.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("multi matmul pipeline"),
+        layout: None,
+        module: &module,
+        entry_point: None,
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let dims_buf = comm.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("multi matmul dims"),
+        size: 16,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
+    comm.queue.write_buffer(
+        &dims_buf,
+        0,
+        bytemuck::cast_slice(&[m as u32, k_i as u32, n as u32, 0u32]),
+    );
+
+    // 为 N 个设备各建 A/B/C buffer 与 bind group，一次 submit 跑完 N 路 matmul。
+    let mut a_bufs = Vec::with_capacity(n_devices);
+    let mut b_bufs = Vec::with_capacity(n_devices);
+    let mut c_bufs = Vec::with_capacity(n_devices);
+    let mut bind_groups = Vec::with_capacity(n_devices);
+    for d in 0..n_devices {
+        let a_buf = het_comm::make_gpu_buffer(&comm.device, a_parts[d].len());
+        let b_buf = het_comm::make_gpu_buffer(&comm.device, b_parts[d].len());
+        let c_buf = het_comm::make_gpu_buffer(&comm.device, m * n);
+        comm.queue.write_buffer(
+            as_gpu(&a_buf).unwrap(),
+            0,
+            bytemuck::cast_slice(&a_parts[d]),
+        );
+        comm.queue.write_buffer(
+            as_gpu(&b_buf).unwrap(),
+            0,
+            bytemuck::cast_slice(&b_parts[d]),
+        );
+        let bg = comm.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("multi matmul bind group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: as_gpu(&a_buf).unwrap(),
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: as_gpu(&b_buf).unwrap(),
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: as_gpu(&c_buf).unwrap(),
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &dims_buf,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        });
+        a_bufs.push(a_buf);
+        b_bufs.push(b_buf);
+        c_bufs.push(c_buf);
+        bind_groups.push(bg);
+    }
+
+    let mut encoder = comm.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("multi matmul encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("multi matmul pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        for bg in &bind_groups {
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(((m + 15) / 16) as u32, ((n + 15) / 16) as u32, 1);
+        }
+    }
+    comm.queue.submit(Some(encoder.finish()));
+
+    // GPU 端 all-reduce：N 个部分和相加，结果 broadcast 回每个 buffer。
+    let mut out = TensorBuf::Cpu(Vec::new());
+    reducer.all_reduce(&c_bufs, &mut out, m * n);
+    let total_us = total_start.elapsed().as_micros();
+    let got = match out {
+        TensorBuf::Cpu(v) => v,
+        TensorBuf::Gpu(_) => unreachable!(),
+    };
+
+    // 与 dense 参考比对。
+    let dense = dense_matmul(&a, &b, m, k, n);
+    let err = max_abs_error(&got, &dense);
+
+    // 同时用 CPU pairwise 参考验证 all-reduce 本身（GPU reduce 正确性交叉验证）。
+    let cpu_sum: Vec<f32> = (0..m * n)
+        .map(|idx| {
+            // 重新用 CPU 算 N 个部分和的对应元素并累加（用 dense 拆分验证）
+            (0..n_devices)
+                .map(|d| {
+                    let a_d = &a_parts[d];
+                    let b_d = &b_parts[d];
+                    let row = idx / n;
+                    let col = idx % n;
+                    (0..k_i)
+                        .map(|t| a_d[row * k_i + t] * b_d[t * n + col])
+                        .sum::<f32>()
+                })
+                .sum::<f32>()
+        })
+        .collect();
+    let all_reduce_ok = max_abs_error(&got, &cpu_sum) < 1e-4;
+
+    MultiPocResult {
+        adapter_name: info.name,
+        n_devices,
+        k_per_device: k_i,
+        max_abs_error: err,
+        all_reduce_ok,
+        total_us,
     }
 }

@@ -11,11 +11,11 @@
 | 项 | 内容 |
 |----|------|
 | **做了什么** | 用 Rust + wgpu 建立跨 CPU / Vulkan GPU 的统一通信域，跑通**真正的张量并行**：行并行切分（A 按列切、B 按行切），CPU/GPU 各持有部分权重并算出 `[M,N]` 部分和，层末 **all-reduce** 相加后与 dense 参考比对 |
-| **结果** | `max_abs_error = 1.192e-6`（P4 行并行，浮点累加顺序差异；远小于 1e-4 阈值），8 个测试全绿 |
+| **结果** | P4 `max_abs_error = 1.192e-6`、P5 4 设备 `1.490e-6`（浮点累加顺序差异；远小于 1e-4），9 个测试全绿 |
 | **硬件** | AMD Ryzen 5 5600 + AMD Radeon RX 5700 XT（Vulkan 1.4） |
 | **技术栈** | Rust + wgpu 30（Vulkan backend）+ WGSL（naga 编译 SPIR-V） |
 | **怎么跑** | `cargo run --offline -p tp-demo --release` |
-| **怎么回归** | `cargo test --offline --workspace`（8 个测试全绿，含坑 3、P0 重叠、P5 GPU→GPU/all-reduce 的回归测试） |
+| **怎么回归** | `cargo test --offline --workspace`（9 个测试全绿，含坑 3、P0 重叠、P5 GPU→GPU/all-reduce、4 设备端到端的回归测试） |
 | **版本控制** | 已 `git init`，基线提交 `836d14f`，改坏可回滚 |
 | **下一步** | 优先级最高的是 **P0：event-based 异步重叠**（见第 9 节） |
 
@@ -156,6 +156,13 @@ total_us          = 980
 overlap_saving_us = 116
 max_abs_error     = 1.192e-6
 P4 通过：行并行 + all-reduce 结果与 dense 参考一致 (err < 1e-4)。
+
+=== 结果（P5：4 逻辑设备 TP + GPU all-reduce）===
+逻辑设备数=4 | K 每设备=64 | Adapter=AMD Radeon RX 5700 XT
+all_reduce_ok   = true
+total_us        = 13115
+max_abs_error   = 1.490e-6
+P5 通过：4 设备行并行 + GPU 端 all-reduce 结果与 dense 参考一致。
 ```
 
 ### 6.2 一键回归测试（推荐）
@@ -397,9 +404,10 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 - **`device_to_device`**（`transport.rs`）：GPU→GPU buffer 拷贝，填补了 `CommDomain::copy` 的 GPU→GPU `todo!()` 分支
 - **`GpuReducer`**（`allreduce.rs`）：GPU 端 pairwise add shader（`shaders/reduce_sum.wgsl`），把 N 个部分和逐元素累加，并 **broadcast 回每个 buffer**（all-reduce 语义：所有参与方持有完整和）
-- 测试增至 8 个：新增 `gpu_to_gpu_copy`、`gpu_all_reduce_three_parts`（3 分片相加 111/222/333/444 通过）
+- **整合进主 demo**：`run_poc_multi(n)`（`tp-demo/src/lib.rs`）用 N 个独立 GPU buffer 做行并行（K 切 N 份）→ N 路 matmul → GPU 端 all-reduce，一条命令里与 P4 路径一起展示
+- 测试增至 9 个：新增 `gpu_to_gpu_copy`、`gpu_all_reduce_three_parts`（3 分片 111/222/333/444）、`multi_device_end_to_end`（4 设备端到端，GPU reduce 与 CPU pairwise 交叉验证一致）
 
-**说明**：P4 demo（2 设备）仍用 CPU 侧 reduce-to-root——对 2 设备更高效且已验证正确；`GpuReducer` 的价值在多设备扩展（测试已覆盖 3 分片）。真实跨物理卡时，`device_to_device` 需改为 host staging 中转（跨 device 的 buffer 不能直接拷贝）。
+**4 设备端到端实测**：K=256 切成 4×64，误差 `1.490e-6`，`all_reduce_ok=true`。P4（2 设备）仍用 CPU 侧 reduce-to-root——对 2 设备更高效；P5 的多设备路径由 `run_poc_multi` 独立展示。真实跨物理卡时，`device_to_device` 需改为 host staging 中转（跨 device 的 buffer 不能直接拷贝）。
 
 **未做**：跨厂商真实多卡验证（需第二张物理 GPU）、ring/tree 拓扑优化（当前是 pairwise reduce + broadcast）、用 `ash` 管理多 adapter。这些需要真实多卡硬件才能继续。
 
@@ -415,7 +423,7 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 6. **`gather_to_cpu` 的按行交错逻辑不要改回整块拼接**：见坑 3；已有回归测试守护（demo 虽已不用 gather，接口仍需保持正确）。
 7. **依赖离线可复现**：用 `--offline` 时依赖必须已在本地缓存（含 P3 新增的 rayon）；换机器时去掉 `--offline` 让 cargo 拉取。
 8. **性能对比必须先预热**：冷启动把 shader 编译计入 GPU 计时，数字会虚高 3~4 倍，不可与稳态值直接比较。
-9. **验收标准已自动化**：改完代码先跑 `cargo test --offline --workspace`（8 个测试），别再靠肉眼读 demo 输出判断是否回归。
+9. **验收标准已自动化**：改完代码先跑 `cargo test --offline --workspace`（9 个测试），别再靠肉眼读 demo 输出判断是否回归。
 
 ---
 
@@ -434,7 +442,7 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 ## 12. 接手人第一天清单
 
 - [ ] `git log --oneline` 确认基线提交 `836d14f`，工作区干净
-- [ ] 跑 `cargo test --offline --workspace`，确认 8 个测试全绿
+- [ ] 跑 `cargo test --offline --workspace`，确认 9 个测试全绿
 - [ ] 跑 `cargo run --offline -p tp-demo --release`，对照第 6.1 节预期输出
 - [ ] 读 `het-comm/src/lib.rs` + `domain.rs`，理解 `TensorBuf` / `CommDomain` / `VulkanComm`
 - [ ] 读 `tp-demo/src/lib.rs` 的 `run_poc()` / `gpu_matmul()`，理解 H2D→compute→D2H 流程（`main.rs` 只是打印壳）

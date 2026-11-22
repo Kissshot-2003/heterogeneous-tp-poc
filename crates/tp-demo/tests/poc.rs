@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use het_comm::{make_gpu_buffer, CommDomain, GpuReducer, TensorBuf, VulkanComm};
 use tp_demo::dense::{dense_matmul, max_abs_error};
 use tp_demo::matmul_cpu::matmul_cpu;
-use tp_demo::run_poc;
+use tp_demo::{run_poc, run_poc_multi};
 
 /// 多个测试同时请求 Vulkan adapter 时会偶发 NotFound（active_backends=0x0），
 /// 用进程内 Mutex 把需要 GPU 的测试串行化。
@@ -163,6 +163,25 @@ fn gpu_all_reduce_three_parts() {
         TensorBuf::Cpu(v) => assert_eq!(v, expected, "all-reduce 应为各分片逐元素和"),
         TensorBuf::Gpu(_) => unreachable!(),
     }
+}
+
+/// P5 整合：N 逻辑设备端到端 TP（行并行 + GPU all-reduce）。
+#[test]
+fn multi_device_end_to_end() {
+    let _guard = GPU_LOCK.lock().unwrap();
+    let r = run_poc_multi(4);
+    assert_eq!(r.n_devices, 4);
+    assert_eq!(r.k_per_device, 64, "K=256 应切成 4×64");
+    assert!(
+        r.all_reduce_ok,
+        "GPU all-reduce 结果应与 CPU pairwise 参考一致"
+    );
+    assert!(
+        r.max_abs_error < 1e-4,
+        "多设备 TP 结果 err = {} >= 1e-4",
+        r.max_abs_error
+    );
+    assert!(r.total_us > 0);
 }
 
 /// CPU matmul 与 dense 参考在小矩阵上逐元素相等。

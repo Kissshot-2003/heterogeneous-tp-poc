@@ -5,7 +5,7 @@
 //!
 //! 运行：cargo run --offline -p tp-demo --release
 
-use tp_demo::{run_poc, DEFAULT_K, DEFAULT_M, DEFAULT_N};
+use tp_demo::{run_poc, run_poc_multi, DEFAULT_K, DEFAULT_M, DEFAULT_N};
 
 fn main() {
     let r = run_poc();
@@ -54,4 +54,25 @@ fn main() {
         r.max_abs_error
     );
     println!("P4 通过：行并行 + all-reduce 结果与 dense 参考一致 (err < 1e-4)。");
+
+    // ===== P5：N 逻辑设备端到端 TP（单卡多 buffer 模拟）=====
+    println!("\n=== 结果（P5：4 逻辑设备 TP + GPU all-reduce）===");
+    let multi = run_poc_multi(4);
+    println!(
+        "逻辑设备数={} | K 每设备={} | Adapter={}",
+        multi.n_devices, multi.k_per_device, multi.adapter_name
+    );
+    println!("all_reduce_ok   = {}", multi.all_reduce_ok);
+    println!("total_us        = {}", multi.total_us);
+    println!("max_abs_error   = {:.3e}", multi.max_abs_error);
+    assert!(
+        multi.all_reduce_ok,
+        "P5 失败：GPU all-reduce 与 CPU pairwise 参考不一致"
+    );
+    assert!(
+        multi.max_abs_error < 1e-4,
+        "P5 失败：max_abs_error = {} >= 1e-4",
+        multi.max_abs_error
+    );
+    println!("P5 通过：4 设备行并行 + GPU 端 all-reduce 结果与 dense 参考一致。");
 }

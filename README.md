@@ -11,7 +11,7 @@
 ```powershell
 cd C:\通用工程\10_heterogeneous-tp-poc
 cargo run --offline -p tp-demo --release   # 跑 Demo
-cargo test --offline --workspace           # 一键回归测试（8 个测试全绿）
+cargo test --offline --workspace           # 一键回归测试（9 个测试全绿）
 ```
 
 预期输出（示意，数字为热启动典型值）：
@@ -33,6 +33,13 @@ total_us          =  980
 overlap_saving_us =  116
 max_abs_error     =  1.192e-6   # vs dense reference  (< 1e-4 => PASS)
 P4 通过：行并行 + all-reduce 结果与 dense 参考一致 (err < 1e-4)。
+
+=== 结果（P5：4 逻辑设备 TP + GPU all-reduce）===
+逻辑设备数=4 | K 每设备=64 | Adapter=AMD Radeon RX 5700 XT
+all_reduce_ok   = true
+total_us        =  13115
+max_abs_error   =  1.490e-6
+P5 通过：4 设备行并行 + GPU 端 all-reduce 结果与 dense 参考一致。
 ```
 
 ## 当前状态
@@ -43,15 +50,15 @@ P4 通过：行并行 + all-reduce 结果与 dense 参考一致 (err < 1e-4)。
 | M2 统一 buffer + H2D/D2H 传输 + smoke compute pass | ✅ 已通过 |
 | M3 CPU/GPU 双路 matmul + 列切分合并 | ✅ 已通过 |
 | M4 数值比对 + 计时报告 | ✅ 已通过 |
-| 自动化回归测试（8 个） | ✅ 全绿，含 gather 按行交错、P0 重叠、P5 GPU→GPU/all-reduce 的回归测试 |
+| 自动化回归测试（9 个） | ✅ 全绿，含 gather 按行交错、P0 重叠、P5 GPU→GPU/all-reduce、多设备端到端的回归测试 |
 | P0 CPU/GPU 异步重叠 | ✅ 已完成，典型收益 23%（1011µs → 780µs） |
 | P1 shared memory tiling | ✅ 已完成，GPU 执行改善 20% 但端到端不可见 |
 | P2 timestamp query | ✅ 已完成，**纯 GPU 计算仅 34µs，88% 墙钟是提交/同步开销** |
 | P2b 合并 submit | ✅ 已完成，D2H 140µs→42µs；**新瓶颈：CPU matmul 成关键路径** |
 | P2c 非均匀切分 | ✅ 已尝试，失败：D2H 存在 16KB staging 阈值，GPU>50% 反而慢 8 倍，已回退 50/50 |
 | P3 加速 CPU | ✅ 已完成（纯 Rust 分块 + rayon，未接 oneDNN）：小形状 160→140µs，大形状 25ms→8ms（3 倍） |
-| P4 真 TP + all-reduce | ✅ 已完成（达成初衷）：行并行切分 + 层末 all-reduce，误差 1.19e-6，6 个测试全绿 |
-| P5 多 GPU 通信路径 | ✅ 已完成（单卡模拟）：GPU→GPU copy + GPU 端 all-reduce（3 分片），8 个测试全绿 |
+| P4 真 TP + all-reduce | ✅ 已完成（达成初衷）：行并行切分 + 层末 all-reduce，误差 1.19e-6 |
+| P5 多 GPU 通信路径 | ✅ 已完成并整合进主 demo（单卡模拟）：GPU→GPU copy + GPU 端 all-reduce，**4 逻辑设备端到端 TP** 跑通（误差 1.49e-6），9 个测试全绿 |
 
 **完整 PoC 已跑通**：真 TP（P4）`max_abs_error = 1.192e-6`（M=64, K=256, N=128；行并行浮点累加顺序差异，远低于 1e-4 阈值）。已 `git init`，基线提交 `836d14f`，当前 `10ffc0a`。
 
