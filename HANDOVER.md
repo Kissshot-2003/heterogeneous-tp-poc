@@ -2,7 +2,7 @@
 
 > 交接日期：2026-11-22
 > 项目路径：`C:\通用工程\10_heterogeneous-tp-poc`
-> 状态：**PoC 四个里程碑全部完成，端到端跑通，数值误差为 0**
+> 状态：**PoC 四个里程碑全部完成，4 个集成测试全绿，git 已初始化并有基线提交**
 
 ---
 
@@ -14,10 +14,12 @@
 | **结果** | `max_abs_error = 0.000e0`（M=64, K=256, N=128），四个里程碑全绿 |
 | **硬件** | AMD Ryzen 5 5600 + AMD Radeon RX 5700 XT（Vulkan 1.4） |
 | **技术栈** | Rust + wgpu 30（Vulkan backend）+ WGSL（naga 编译 SPIR-V） |
-| **怎么跑** | `cd C:\通用工程\10_heterogeneous-tp-poc && cargo run --offline -p tp-demo --release` |
+| **怎么跑** | `cargo run --offline -p tp-demo --release` |
+| **怎么回归** | `cargo test --offline --workspace`（4 个测试全绿，含坑 3 的回归测试） |
+| **版本控制** | 已 `git init`，基线提交 `836d14f`，改坏可回滚 |
 | **下一步** | 优先级最高的是 **P0：event-based 异步重叠**（见第 9 节） |
 
-一句话结论：**可行性已验证，但当前版本没有性能收益**——GPU shader 是朴素实现，端到端比纯 CPU 还慢。这是预期内的，PoC 的目的是验证通信域底座，不是性能。
+一句话结论：**可行性已验证，稳态下没有净性能收益**——朴素 WGSL shader 略慢于 CPU，端到端还包含传输与初始化。这是预期内的，PoC 的目的是验证通信域底座，不是性能；详见第 8 节（含冷/热启动区分）。
 
 ---
 
@@ -63,6 +65,17 @@
 - oneDNN 的 GPU 引擎走 SYCL/OpenCL，**不走 Vulkan**，两者是并列后端而非组合；
 - PoC 阶段的核心是通信域，不是算子性能。`matmul_cpu` 已做成独立函数，后续通过 FFI 替换成 oneDNN 即可，通信域代码不用改。
 
+### 3.4 考虑过但否决的方案（避免重复调研）
+
+| 方案 | 否决原因 |
+|------|---------|
+| **C++ + Vulkan SDK 直写** | 本机无 C++ 编译器、无 `glslc`；装 VS Build Tools + SDK 成本远超 PoC 需要。WGSL + naga 能达成同样目的且零安装 |
+| **oneDNN 作为 CPU 算子后端** | 本机 AMD CPU 拿不到 AVX-512/AMX 红利；oneDNN 的 GPU 引擎走 SYCL/OpenCL 不走 Vulkan，与本 PoC 路径不兼容。FFI 接入留到 P3 |
+| **MPI / UCX 做控制面与传输** | 能解决 host 端传输，但 GPU-direct 跨厂商不可用（主要支持 CUDA/ROCm），且引入额外依赖；PoC 用 `write_buffer` + staging buffer 已够 |
+| **`ash` 直接操作 Vulkan** | 控制力最强，但需手写内存管理、shader 编译、同步原语，开发量数倍于 wgpu。PoC 不需要这种控制力 |
+| **直接实现 all-reduce** | 当前列切分只需 2 路 gather；all-reduce 需切分 A 与 B 并对等通信，超出"最小 PoC"范围，留到 P4 |
+| **一开始接入多 GPU** | 单 CPU + 单 GPU 已能验证统一通信域；多卡引入 P2P/拓扑/同步复杂度，顺序上放在 P5 |
+
 ---
 
 ## 4. 项目结构与关键文件
@@ -75,6 +88,7 @@
 ├── PLAN.md                 # 完整方案（架构/API/里程碑/验收/风险）
 ├── HANDOVER.md             # 本文档
 ├── .gitignore
+├── .git/                   # 已 git init；基线提交 836d14f
 ├── crates/
 │   ├── het-comm/           # 【核心交付物】统一通信域 crate
 │   │   ├── Cargo.toml
@@ -86,112 +100,83 @@
 │   │       └── domain.rs       # VulkanComm：CommDomain 的具体实现
 │   └── tp-demo/            # 验证程序
 │       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs         # M1~M4 流程编排 + gpu_matmul() + 计时报告
-│           ├── matmul_cpu.rs   # CPU naive matmul（未来 FFI 换 oneDNN 的位置）
-│           ├── dense.rs        # dense 参考 + max_abs_error
-│           └── shaders/
-│               └── matmul.wgsl # GPU compute matmul（WGSL → SPIR-V）
+│       ├── src/
+│       │   ├── lib.rs          # 核心：run_poc() / gpu_matmul() / smoke_compute() + PocResult
+│       │   ├── main.rs         # 只负责打印 run_poc() 结果并断言
+│       │   ├── matmul_cpu.rs   # CPU naive matmul（未来 FFI 换 oneDNN 的位置）
+│       │   ├── dense.rs        # dense 参考 + max_abs_error
+│       │   └── shaders/
+│       │       └── matmul.wgsl # GPU compute matmul（WGSL → SPIR-V）
+│       └── tests/
+│           └── poc.rs          # 4 个集成测试（含坑 3 的回归测试）
 ```
 
-**接手人优先读**：`het-comm/src/lib.rs`（接口）→ `domain.rs`（实现）→ `tp-demo/src/main.rs`（用法）。
+**接手人优先读**：`het-comm/src/lib.rs`（接口）→ `domain.rs`（实现）→ `tp-demo/src/lib.rs::run_poc()`（端到端用法）。`main.rs` 只是打印壳，不用读。
 
 ---
 
-## 5. 核心 API（必须理解）
+## 5. 核心 API（最小摘要）
 
-### 5.1 `TensorBuf` —— 统一缓冲区
+> 详细设计与数据流图见 [PLAN.md 第 4 节](PLAN.md#4-架构设计)，这里只保留接手人必须知道的最小集合。
 
-```rust
-pub enum TensorBuf {
-    Cpu(Vec<f32>),        // 宿主内存，f32 行主序
-    Gpu(wgpu::Buffer),    // GPU storage buffer
-}
-```
+- **`TensorBuf`**：`Cpu(Vec<f32>)` 或 `Gpu(wgpu::Buffer)`，统一 CPU/GPU 内存。
+- **`CommDomain` trait**：`copy` / `gather_to_cpu` / `barrier` 三个方法。上层只依赖它、不直接碰 wgpu——这是 P0 异步重叠能"只改实现、不动调用方"的关键。
+- **`VulkanComm`**：当前唯一实现，持有 `device`/`queue`。`copy` 自动分派 CPU→CPU / CPU→GPU（`write_buffer`）/ GPU→CPU（staging buffer）；**GPU→GPU 是 `todo!()`**，单卡 PoC 用不到。
+- **`run_poc()`**（`tp-demo/src/lib.rs`）：端到端流程，返回 `PocResult`（含 5 项耗时与误差）。`main.rs` 和集成测试共用它，避免"测试通过但 demo 行为不同"。
 
-所有计算和传输都以它为输入输出，避免各模块自己管内存。
-
-### 5.2 `CommDomain` trait —— 上层唯一依赖的边界
-
-```rust
-pub trait CommDomain {
-    fn copy(&self, src: &TensorBuf, dst: &mut TensorBuf, len: usize);
-    fn gather_to_cpu(&self, parts: &[TensorBuf], out: &mut TensorBuf, rows: usize, cols: usize);
-    fn barrier(&self);
-}
-```
-
-设计原则：上层 TP 逻辑**只依赖这个 trait**，不直接碰 wgpu。未来接 oneDNN、多 GPU 或换后端时，只替换实现，不改调用方。
-
-### 5.3 `VulkanComm` —— 当前实现
-
-```rust
-pub struct VulkanComm {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-}
-impl VulkanComm {
-    pub async fn new(adapter: &wgpu::Adapter) -> Self { ... }
-}
-```
-
-`copy` 内部自动分派：CPU→CPU、CPU→GPU（`queue.write_buffer`）、GPU→CPU（staging buffer + map）。GPU→GPU 目前是 `todo!()`（单 GPU PoC 不需要）。
-
-### 5.4 数据流（列切分 TP）
-
-```
-A [M,K] (CPU)        B [K,N] (CPU)
-                         │
-                列切分 → B0 [K,N/2] (CPU)  +  B1 [K,N/2] (CPU)
-                         │
-   ┌─────────────────────┴─────────────────────┐
-   │                                           │
-CPU: C0 = A × B0                      H2D: A, B1 → GPU
-   │                                  GPU: C1 = A × B1 (WGSL shader)
-   │                                  D2H: C1 → CPU
-   └─────────────┬─────────────────────────────┘
-                 ▼
-       gather（按行交错）→ C [M,N] (CPU)
-                 ▼
-       与 dense A × B 比对 → max_abs_error
-```
-
-**注意**：这是"伪 TP"——真正的 TP 会连 `A` 一起切，各设备持有部分权重，通信是 all-reduce。本 PoC 用列切分 + gather 是为了用最小通信量验证通信域底座。all-reduce 留到后续阶段。
+**关键边界**：当前是列切分 + gather 的**"伪 TP"，没有 all-reduce**。真正的 TP 要切分 A 和 B、各设备持有部分权重、层末 all-reduce。别把 gather 当成完整 TP 实现。
 
 ---
 
 ## 6. 运行与验证
+
+### 6.1 跑 Demo
 
 ```powershell
 cd C:\通用工程\10_heterogeneous-tp-poc
 cargo run --offline -p tp-demo --release
 ```
 
-预期输出：
+预期输出（数字为热启动典型值，允许波动，见第 8 节）：
 
 ```
-Adapter: AMD Radeon RX 5700 XT | backend=Vulkan | vendor=0x1002 device=0x731f
+Adapter: AMD Radeon RX 5700 XT | backend=Vulkan
 M1 通过：Vulkan adapter 可用。
-M2a 通过：[4] 向量 H2D→D2H 回环一致。
-M2b 通过（smoke compute pass 已在 M2 阶段验证，见 PLAN.md）。
+M2a 通过：[4] 向量 H2D→D2H 回环。
+M2b 通过：smoke compute pass (data[i]+=1)。
 
 === 结果 ===
 dims: M=64 K=256 N=128 (每半 64 列)
-cpu_matmul_us   = 272
-h2d_transfer_us = 50
-gpu_matmul_us   = 1107
-d2h_transfer_us = 123
-total_us        = 2310
+cpu_matmul_us   = 165
+h2d_transfer_us = 49
+gpu_matmul_us   = 279
+d2h_transfer_us = 107
+total_us        = 888
 max_abs_error   = 0.000e0
 M3/M4 通过：列切分 + gather 结果与 dense 参考一致 (err < 1e-4)。
 ```
 
-验收标准（5 条，全部满足才算通过）：
-1. `adapter.get_info().backend == Backends::VULKAN`，设备名为 AMD Radeon RX 5700 XT
-2. `max_abs_error < 1e-4`（默认形状）
-3. H2D 与 D2H 各至少一次，且回传数据参与最终 gather
-4. 输出 5 项耗时
-5. 连续 3 次运行结果一致
+### 6.2 一键回归测试（推荐）
+
+5 条验收标准已固化为自动化测试：
+
+```powershell
+cargo test --offline --workspace
+```
+
+预期：`running 4 tests ... test result: ok. 4 passed; 0 failed`，覆盖：
+- `poc_end_to_end` — 端到端验收
+- `gather_is_row_interleaved` — **坑 3 的回归测试**，改回整块拼接会立刻失败
+- `matmul_cpu_matches_dense` — CPU 算子正确性
+- `max_abs_error_detects_mismatch` — 比对函数本身
+
+### 6.3 验收标准
+
+1. `adapter.get_info().backend == Backends::VULKAN`（测试覆盖）；具体型号 AMD Radeon RX 5700 XT 由人工确认
+2. `max_abs_error < 1e-4`（测试覆盖）
+3. H2D 与 D2H 各至少一次，且回传数据参与最终 gather（测试覆盖）
+4. 输出 5 项耗时（测试覆盖）
+5. 连续 3 次运行结果一致 —— 由端到端测试 + 第 8 节 3 次采样覆盖
 
 > Windows PowerShell 下中文输出末尾可能出现乱码（GBK 解码 UTF-8），功能正常，不影响验收。
 
@@ -241,20 +226,25 @@ for i in 0..rows {
 
 ## 8. 性能数据与解读
 
-| 阶段 | 耗时（µs） |
-|------|-----------|
-| CPU matmul（算左半） | 272 |
-| H2D 传输 | 50 |
-| GPU matmul（算右半） | 1107 |
-| D2H 传输 | 123 |
-| **端到端 total** | **2310** |
+**3 次热启动采样（重复运行 release 二进制，排除首次编译开销）：**
+
+| 阶段 | 范围（µs） | 典型值 |
+|------|-----------|--------|
+| CPU matmul（算左半） | 164 ~ 205 | 165 |
+| H2D 传输 | 47 ~ 61 | 49 |
+| GPU matmul（算右半） | 277 ~ 323 | 279 |
+| D2H 传输 | 106 ~ 142 | 107 |
+| **端到端 total** | **877 ~ 1087** | 888 |
+| `max_abs_error` | 0 | 0 |
+
+⚠️ **冷启动陷阱**：首次运行时 `gpu_matmul_us` 曾达到 1107~1845µs，因为 shader 编译、pipeline/buffer 创建被计入了 GPU 阶段计时。热启动稳定在 277~323µs。之前"GPU 比 CPU 慢 4 倍"的说法来自冷启动值，**不代表稳态性能**。对比性能前务必预热。
 
 解读：
 
-- **GPU 比 CPU 慢得多**：1107µs vs 272µs。原因是 WGSL shader 是朴素实现——每个输出元素一个线程，串行累加 K=256 次，没有 tiling/shared memory，且 workgroup 只有 8×8。
-- **传输不是主要瓶颈**：H2D 50µs + D2H 123µs 远小于 GPU 计算时间。但这是因为形状小（A=64×256，B1=256×64，C1=64×64，总共约 48KB）。
-- **`total_us` 大于各阶段之和**：因为 total 包含 shader 编译、pipeline/object 创建等一次性初始化开销（在 `gpu_matmul()` 内部、计时开始前）。PoC 未做预热。
-- **结论**：当前版本没有性能收益，纯 CPU 算全量大约 550µs，比异构方案快 4 倍。这**不是 PoC 失败**——PoC 验证的是可行性。性能优化是下一步的事。
+- **稳态下 GPU 仍略慢于 CPU**：277~323µs vs 164~205µs。WGSL shader 是朴素实现——每输出元素一线程、串行累加 K=256、无 tiling/shared memory、workgroup 仅 8×8。
+- **传输占比不低但非主导**：H2D 47~61µs + D2H 106~142µs。当前形状小（A=64×256、B1=256×64、C1=64×64，约 48KB），传输还未放大成瓶颈。
+- **`total_us` 大于各阶段之和**：total 从 CPU matmul 开始计时，包含 `gpu_matmul()` 内的一次性初始化、gather 与 dense 参考计算。**不要直接相加各阶段来核对 total**。
+- **结论**：当前版本没有净性能收益——纯 CPU 算全量约 330~410µs（两倍于左半），异构方案 877~1087µs。这**不是 PoC 失败**：PoC 验证的是通信域可行性。性能优化见 P0/P1。
 
 ---
 
@@ -277,7 +267,7 @@ for i in 0..rows {
 
 - workgroup size 从 8×8 调到 16×16 或 32×8
 - 用 shared memory 做 tiling，减少全局内存读取
-- 目标：GPU matmul 低于 CPU 的 272µs（当前 1107µs）
+- 目标：GPU matmul 稳态低于 CPU 的 164~205µs（当前稳态 277~323µs，冷启动可达 1107µs，见第 8 节）
 
 ### P2：更大形状测试
 
@@ -311,8 +301,10 @@ for i in 0..rows {
 3. **GPU→GPU 是 `todo!()`**：单 GPU PoC 用不到，多卡时必须实现。
 4. **一次性初始化未计入分阶段耗时**：`total_us` 包含 shader 编译/pipeline 创建，比较性能时别直接相加各阶段。
 5. **数值比对用 f32**：当前误差为 0，但换更大 K 或用不同累加顺序时可能到 1e-5 量级，验收阈值 1e-4 留有空间。
-6. **`gather_to_cpu` 的按行交错逻辑不要改回整块拼接**：见坑 3。
+6. **`gather_to_cpu` 的按行交错逻辑不要改回整块拼接**：见坑 3；已有回归测试守护。
 7. **依赖离线可复现**：用 `--offline` 时依赖必须已在本地缓存；换机器时去掉 `--offline` 让 cargo 拉取。
+8. **性能对比必须先预热**：冷启动把 shader 编译计入 GPU 计时，数字会虚高 3~4 倍，不可与稳态值直接比较。
+9. **验收标准已自动化**：改完代码先跑 `cargo test --offline --workspace`，别再靠肉眼读 demo 输出判断是否回归。
 
 ---
 
@@ -330,8 +322,10 @@ for i in 0..rows {
 
 ## 12. 接手人第一天清单
 
-- [ ] 跑一遍 `cargo run --offline -p tp-demo --release`，确认 5 条验收标准
+- [ ] `git log --oneline` 确认基线提交 `836d14f`，工作区干净
+- [ ] 跑 `cargo test --offline --workspace`，确认 4 个测试全绿
+- [ ] 跑 `cargo run --offline -p tp-demo --release`，对照第 6.1 节预期输出
 - [ ] 读 `het-comm/src/lib.rs` + `domain.rs`，理解 `TensorBuf` / `CommDomain` / `VulkanComm`
-- [ ] 读 `tp-demo/src/main.rs` 的 `gpu_matmul()`，理解 H2D→compute→D2H 流程
+- [ ] 读 `tp-demo/src/lib.rs` 的 `run_poc()` / `gpu_matmul()`，理解 H2D→compute→D2H 流程（`main.rs` 只是打印壳）
 - [ ] 读第 7 节踩坑记录，特别是坑 3（gather 按行交错）
-- [ ] 决定 P0（异步重叠）是否启动；启动则先设计 event/handle 方案再动手
+- [ ] 决定 P0（异步重叠）是否启动；启动则先设计 event/handle 方案再动手，改完跑 `cargo test` 回归

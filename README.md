@@ -10,20 +10,26 @@
 
 ```powershell
 cd C:\通用工程\10_heterogeneous-tp-poc
-cargo run -p tp-demo --release
+cargo run --offline -p tp-demo --release   # 跑 Demo
+cargo test --offline --workspace           # 一键回归测试（4 个测试全绿）
 ```
 
-预期输出（示意）：
+预期输出（示意，数字为热启动典型值）：
 
 ```
-Adapter: AMD Radeon RX 5700 XT (Vulkan)
-dims: M=64 K=256 N=128
-cpu_matmul_us    =  ...
-h2d_transfer_us  =  ...   # A, B1 上传
-gpu_matmul_us    =  ...
-d2h_transfer_us  =  ...   # C1 回传
-total_us         =  ...
-max_abs_error    =  ...   # vs dense reference  (< 1e-4 => PASS)
+Adapter: AMD Radeon RX 5700 XT | backend=Vulkan
+M1 通过：Vulkan adapter 可用。
+M2a 通过：[4] 向量 H2D→D2H 回环。
+M2b 通过：smoke compute pass (data[i]+=1)。
+
+=== 结果 ===
+dims: M=64 K=256 N=128 (每半 64 列)
+cpu_matmul_us    =  165
+h2d_transfer_us  =  49    # A, B1 上传
+gpu_matmul_us    =  279
+d2h_transfer_us  =  107   # C1 回传
+total_us         =  888
+max_abs_error    =  0.000e0   # vs dense reference  (< 1e-4 => PASS)
 ```
 
 ## 当前状态
@@ -34,10 +40,11 @@ max_abs_error    =  ...   # vs dense reference  (< 1e-4 => PASS)
 | M2 统一 buffer + H2D/D2H 传输 + smoke compute pass | ✅ 已通过 |
 | M3 CPU/GPU 双路 matmul + 列切分合并 | ✅ 已通过 |
 | M4 数值比对 + 计时报告 | ✅ 已通过 |
+| 自动化回归测试（4 个） | ✅ 全绿，含 gather 按行交错的回归测试 |
 
-**完整 PoC 已跑通**：`max_abs_error = 0.000e0`（M=64, K=256, N=128）。
+**完整 PoC 已跑通**：`max_abs_error = 0.000e0`（M=64, K=256, N=128）。已 `git init`，基线提交 `836d14f`。
 
-> 注意：`total_us` 包含 shader 编译、pipeline/buffer 创建等一次性初始化开销，因此大于各阶段之和；PoC 阶段只验证可行性，未做预热与性能优化。
+> 注意：首次运行的 `gpu_matmul_us` 会包含 shader 编译开销（可达 1107µs），热启动稳定在 277~323µs；`total_us` 还包含 gather 与 dense 参考计算，不要直接相加各阶段核对。详见 HANDOVER.md 第 8 节。
 
 ## 文档
 

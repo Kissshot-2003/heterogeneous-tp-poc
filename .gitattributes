@@ -1,0 +1,2 @@
+# 统一文本文件换行符，消除 Windows 下 LF→CRLF 警告
+* text=auto

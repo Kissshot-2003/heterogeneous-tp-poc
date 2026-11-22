@@ -201,13 +201,13 @@ CPU: C0 = A × B0                          H2D: A, B1 → GPU
 
 ## 7. 验收标准
 
-PoC 通过必须同时满足：
+PoC 通过必须同时满足（**已固化为 `cargo test --offline --workspace` 的 4 个自动化测试**，见 `crates/tp-demo/tests/poc.rs`）：
 
-1. **后端正确**：`adapter.get_info().backend == Backends::VULKAN`，设备名为 AMD Radeon RX 5700 XT。
+1. **后端正确**：`adapter.get_info().backend == Backends::VULKAN`；具体型号 AMD Radeon RX 5700 XT 由人工确认（测试不断言型号以保证可移植）。
 2. **数值正确**：`max(|C[i,j] - C_dense[i,j]|) < 1e-4`，默认形状 `M=64, K=256, N=128`。
 3. **传输真实发生**：H2D 与 D2H 各至少一次，且回传数据参与最终 cat（不是 CPU 自己算完假装的）。
 4. **计时完整**：输出 `cpu_matmul_us / h2d_transfer_us / gpu_matmul_us / d2h_transfer_us / total_us`。
-5. **可重复**：`cargo run -p tp-demo --release` 连续 3 次结果一致。
+5. **可重复**：3 次采样误差均为 0、耗时在稳定范围（见 HANDOVER.md 第 8 节）；由端到端测试 + 采样覆盖。
 
 ---
 
