@@ -10,8 +10,8 @@
 
 | 项 | 内容 |
 |----|------|
-| **做了什么** | 用 Rust + wgpu 建立跨 CPU / Vulkan GPU 的统一通信域，跑通一次真实的张量并行切分：矩阵按列切成两半，CPU 算左半、GPU 算右半，按行交错 gather 回 CPU，与 dense 参考逐元素比对 |
-| **结果** | `max_abs_error = 0.000e0`（M=64, K=256, N=128），四个里程碑全绿 |
+| **做了什么** | 用 Rust + wgpu 建立跨 CPU / Vulkan GPU 的统一通信域，跑通**真正的张量并行**：行并行切分（A 按列切、B 按行切），CPU/GPU 各持有部分权重并算出 `[M,N]` 部分和，层末 **all-reduce** 相加后与 dense 参考比对 |
+| **结果** | `max_abs_error = 1.192e-6`（P4 行并行，浮点累加顺序差异；远小于 1e-4 阈值），6 个测试全绿 |
 | **硬件** | AMD Ryzen 5 5600 + AMD Radeon RX 5700 XT（Vulkan 1.4） |
 | **技术栈** | Rust + wgpu 30（Vulkan backend）+ WGSL（naga 编译 SPIR-V） |
 | **怎么跑** | `cargo run --offline -p tp-demo --release` |
@@ -374,11 +374,18 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 - **前置条件**：本机需要装 C++ 工具链（VS Build Tools）+ oneDNN 库；或用 Rust 的 oneDNN binding
 - 注意 AMD CPU 上拿不到 AVX-512/AMX 红利
 
-### P4：真 TP + all-reduce
+### P4：真 TP + all-reduce ✅ 已完成（达成项目初衷）
 
-- 切分 `A` 和 `B`，各设备持有部分权重
-- 实现 all-reduce（ring 或 tree）替代当前的 gather
-- 可参考 AsymGroup 的非均匀切分
+从"伪 TP"（列切分 + gather）升级为**真正的张量并行**：
+
+- **行并行切分**：`A[M,K]` 按列切成 `A0[M,K/2]`/`A1[M,K/2]`，`B[K,N]` 按行切成 `B0[K/2,N]`/`B1[K/2,N]`；各设备持有部分权重
+- 数学依据：`[A0|A1] × [B0;B1] = A0×B0 + A1×B1`——各设备算 `[M,N]` 部分和
+- **层末 all-reduce**：`CommDomain` 新增 `all_reduce()`，把部分和按元素相加（`all_reduce_to_cpu`：GPU 分片读回后累加）
+- 2 设备场景下 broadcast 回 GPU 可省（最终输出在 CPU），多卡时再补
+
+**结果**：5 次采样误差恒为 `1.192e-6`（浮点顺序差异，非 bug），端到端 ~980µs，CPU 121µs / GPU 45µs / 重叠仍生效。测试增至 6 个（新增 `all_reduce_sums_partials`）。
+
+**遗留**：all-reduce 目前是 CPU 侧 reduce-to-root；P5 多卡时需实现 GPU→GPU（当前 `copy` 的 GPU→GPU 分支仍是 `todo!()`）和真正的 ring/tree all-reduce。
 
 ### P5：多 GPU 与跨厂商
 

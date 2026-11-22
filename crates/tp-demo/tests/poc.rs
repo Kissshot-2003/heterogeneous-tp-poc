@@ -92,6 +92,26 @@ fn gather_is_row_interleaved() {
     }
 }
 
+/// P4 验证：all-reduce 把多个部分和按元素相加。
+#[test]
+fn all_reduce_sums_partials() {
+    let _guard = GPU_LOCK.lock().unwrap();
+    let adapter = pollster::block_on(het_comm::request_vulkan_adapter());
+    let comm = pollster::block_on(VulkanComm::new(&adapter));
+
+    let parts = [
+        TensorBuf::Cpu(vec![1.0, 2.0, 3.0, 4.0]),
+        TensorBuf::Cpu(vec![10.0, 20.0, 30.0, 40.0]),
+    ];
+    let mut out = TensorBuf::Cpu(Vec::new());
+    comm.all_reduce(&parts, &mut out, 2, 2);
+
+    match out {
+        TensorBuf::Cpu(v) => assert_eq!(v, vec![11.0, 22.0, 33.0, 44.0]),
+        TensorBuf::Gpu(_) => unreachable!(),
+    }
+}
+
 /// CPU matmul 与 dense 参考在小矩阵上逐元素相等。
 #[test]
 fn matmul_cpu_matches_dense() {

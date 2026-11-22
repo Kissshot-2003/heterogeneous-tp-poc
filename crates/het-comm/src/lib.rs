@@ -43,6 +43,11 @@ pub trait CommDomain {
         widths: &[usize],
     );
 
+    /// 对所有分片按元素求和（all-reduce 的 reduce-to-CPU 侧）。
+    /// `parts` 为各设备的 `rows × cols` 部分和分片；`out` 为累加结果。
+    /// 2 设备场景下 broadcast 回 GPU 可省（最终输出在 CPU），留到多卡阶段。
+    fn all_reduce(&self, parts: &[TensorBuf], out: &mut TensorBuf, rows: usize, cols: usize);
+
     /// 等待所有在途工作完成。PoC 阶段用阻塞等待，正确性优先。
     fn barrier(&self);
 }

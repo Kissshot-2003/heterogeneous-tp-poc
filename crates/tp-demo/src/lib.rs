@@ -16,18 +16,10 @@ use het_comm::{as_gpu, CommDomain, TensorBuf, VulkanComm};
 use crate::dense::{dense_matmul, max_abs_error};
 use crate::matmul_cpu::{matmul_cpu, warmup_matmul_cpu};
 
-/// 默认形状：M=64, K=256, N=128（列切分后每半 64 列）。
+/// 默认形状：M=64, K=256, N=128（P4 行并行：K 对半切，各算 [M,N] 部分和）。
 pub const DEFAULT_M: usize = 64;
 pub const DEFAULT_K: usize = 256;
 pub const DEFAULT_N: usize = 128;
-
-/// P2c：GPU 承担的列比例。
-///
-/// 理论最优约 0.62（按算力比例），但实测发现 wgpu/Vulkan 的 D2H 存在
-/// **16KB staging buffer 快路径阈值**：C1 超过 16KB（gpu_cols > 64）时
-/// map 耗时从 ~40µs 暴涨到 ~300µs。因此本机保持 0.5（C1=16KB）反而最快。
-/// 详细数据与尝试见 HANDOVER.md 第 9 节 P2c。
-pub const GPU_COL_FRACTION: f64 = 0.5;
 
 /// 一次 PoC 运行的完整结果，供打印与测试断言共用。
 #[derive(Debug, Clone)]
@@ -54,9 +46,9 @@ pub struct PocResult {
     pub total_us: u128,
     /// 重叠节省的时间：CPU 计算被 GPU 等待覆盖的部分
     pub overlap_saving_us: u128,
-    /// P2c：非均匀切分的列数（CPU / GPU）
-    pub cpu_cols: usize,
-    pub gpu_cols: usize,
+    /// P4：行并行切分的 K 维度（CPU / GPU），各算 [M,N] 部分和
+    pub cpu_k: usize,
+    pub gpu_k: usize,
 }
 
 /// 已提交到 GPU、等待取回的 matmul 任务。
@@ -399,11 +391,13 @@ pub fn run_poc() -> PocResult {
     // P3：预热 rayon 线程池，使首次启动开销不计入 matmul 计时。
     warmup_matmul_cpu();
 
-    // ===== M3：双路 matmul + 非均匀列切分（P0 重叠 + P2c 非均匀）=====
+    // ===== M3 / P4：真 TP —— 行并行 + all-reduce =====
+    // 数学依据：A[M,K] × B[K,N] = [A0|A1] × [B0;B1] = A0×B0 + A1×B1
+    //   各设备持有部分权重（A 按列切、B 按行切），
+    //   各自算 [M,N] 的部分和，层末 all-reduce 相加 —— 这才是真正的 TP。
     let (m, k, n) = (DEFAULT_M, DEFAULT_K, DEFAULT_N);
-    let gpu_cols = (n as f64 * GPU_COL_FRACTION) as usize;
-    let cpu_cols = n - gpu_cols;
-    assert!(cpu_cols > 0 && gpu_cols > 0, "切分比例必须为正");
+    let cpu_k = k / 2;
+    let gpu_k = k - cpu_k;
 
     // 确定性伪随机输入，范围 [-0.5, 0.5]。
     let a: Vec<f32> = (0..m * k)
@@ -413,41 +407,43 @@ pub fn run_poc() -> PocResult {
         .map(|i| ((i * 31 % 89) as f32) / 89.0 - 0.5)
         .collect();
 
-    // P2c：B 按非均匀列切成 B0 [K, cpu_cols]（CPU）与 B1 [K, gpu_cols]（GPU）。
-    let mut b0 = Vec::with_capacity(k * cpu_cols);
-    let mut b1 = Vec::with_capacity(k * gpu_cols);
-    for t in 0..k {
-        for j in 0..cpu_cols {
-            b0.push(b[t * n + j]);
+    // A 按列切成 A0 [M, cpu_k]（CPU）与 A1 [M, gpu_k]（GPU）。
+    let mut a0 = Vec::with_capacity(m * cpu_k);
+    let mut a1 = Vec::with_capacity(m * gpu_k);
+    for i in 0..m {
+        for t in 0..cpu_k {
+            a0.push(a[i * k + t]);
         }
-        for j in 0..gpu_cols {
-            b1.push(b[t * n + cpu_cols + j]);
+        for t in 0..gpu_k {
+            a1.push(a[i * k + cpu_k + t]);
         }
     }
+    // B 按行切成 B0 [cpu_k, N]（CPU）与 B1 [gpu_k, N]（GPU）。
+    let b0 = b[..cpu_k * n].to_vec();
+    let b1 = b[cpu_k * n..].to_vec();
 
     let total_start = Instant::now();
 
-    // 1) 提交 GPU（H2D + compute），立即返回。
-    let (pending, h2d_us) = gpu_matmul_submit(&comm, &a, &b1, m, k, gpu_cols);
+    // 1) 提交 GPU：算 A1 × B1（部分和 C1 [M,N]），立即返回。
+    let (pending, h2d_us) = gpu_matmul_submit(&comm, &a1, &b1, m, gpu_k, n);
     let gpu_wall_start = Instant::now();
 
-    // 2) CPU 算左半 C0 —— 与 GPU 执行重叠。
+    // 2) CPU 算 C0 = A0 × B0（部分和 [M,N]）—— 与 GPU 执行重叠。
     let t = Instant::now();
-    let c0 = matmul_cpu(&a, &b0, m, k, cpu_cols);
+    let c0 = matmul_cpu(&a0, &b0, m, cpu_k, n);
     let cpu_us = t.elapsed().as_micros();
 
-    // 3) 直接取回（P2b：compute + D2H copy 已合并为同一次 submit，无需 barrier）。
+    // 3) 取回 GPU 的部分和 C1。
     let (c1, d2h_us, ts_guard) = gpu_matmul_collect(&comm, pending);
-    // 先测 GPU 墙钟，再读 timestamp（读回本身会产生额外 submit/poll）
     let gpu_wall_us = gpu_wall_start.elapsed().as_micros();
     let gpu_compute_us = read_gpu_timestamps(&comm, ts_guard);
 
-    // 4) Gather：按行交错拼成完整 [M, N]（见 HANDOVER.md 坑 3）。
+    // 4) All-reduce：C = C0 + C1（层末规约），得到完整 [M,N]。
     let parts = [TensorBuf::Cpu(c0), TensorBuf::Cpu(c1)];
-    let mut gathered = TensorBuf::Cpu(Vec::with_capacity(m * n));
-    comm.gather_to_cpu(&parts, &mut gathered, m, &[cpu_cols, gpu_cols]);
+    let mut reduced = TensorBuf::Cpu(Vec::with_capacity(m * n));
+    comm.all_reduce(&parts, &mut reduced, m, n);
     let total_us = total_start.elapsed().as_micros();
-    let got = match gathered {
+    let got = match reduced {
         TensorBuf::Cpu(v) => v,
         TensorBuf::Gpu(_) => unreachable!(),
     };
@@ -475,7 +471,7 @@ pub fn run_poc() -> PocResult {
         d2h_transfer_us: d2h_us,
         total_us,
         overlap_saving_us,
-        cpu_cols,
-        gpu_cols,
+        cpu_k,
+        gpu_k,
     }
 }

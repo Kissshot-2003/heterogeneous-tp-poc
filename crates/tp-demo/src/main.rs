@@ -21,15 +21,10 @@ fn main() {
         if r.smoke_compute_ok { "通过" } else { "失败" }
     );
 
-    println!("\n=== 结果（P0：CPU 与 GPU 重叠）===");
+    println!("\n=== 结果（P4：真 TP 行并行 + all-reduce）===");
     println!(
-        "dims: M={} K={} N={} | 非均匀切分: CPU={} 列 / GPU={} 列 ({:.0}%)",
-        DEFAULT_M,
-        DEFAULT_K,
-        DEFAULT_N,
-        r.cpu_cols,
-        r.gpu_cols,
-        r.gpu_cols as f64 / DEFAULT_N as f64 * 100.0
+        "dims: M={} K={} N={} | 行并行: CPU K={} / GPU K={} (各算 [M,N] 部分和)",
+        DEFAULT_M, DEFAULT_K, DEFAULT_N, r.cpu_k, r.gpu_k
     );
     println!("h2d_submit_us    = {}", r.h2d_submit_us);
     println!(

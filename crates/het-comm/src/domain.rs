@@ -4,7 +4,7 @@
 //! 上层 TP 逻辑只依赖 trait，未来换 oneDNN / 多卡时不改调用方。
 
 use crate::{
-    collectives::gather_to_cpu,
+    collectives::{all_reduce_to_cpu, gather_to_cpu},
     device_to_host,
     host_to_device,
     CommDomain,
@@ -70,6 +70,10 @@ impl CommDomain for VulkanComm {
         widths: &[usize],
     ) {
         gather_to_cpu(&self.device, &self.queue, parts, out, rows, widths)
+    }
+
+    fn all_reduce(&self, parts: &[TensorBuf], out: &mut TensorBuf, rows: usize, cols: usize) {
+        all_reduce_to_cpu(&self.device, &self.queue, parts, out, rows, cols)
     }
 
     fn barrier(&self) {

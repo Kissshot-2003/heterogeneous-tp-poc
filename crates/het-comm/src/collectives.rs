@@ -52,3 +52,41 @@ pub fn gather_to_cpu(
         }
     }
 }
+
+/// 对所有分片按元素求和（all-reduce 的 reduce-to-CPU 侧，P4）。
+///
+/// 真正的 TP（行并行）里，各设备持有 `A_i × B_i` 的部分和
+/// `[M, N]`，层末 all-reduce 把它们相加得到完整输出。
+/// 本实现把 GPU 分片读回 CPU 后逐元素累加；2 设备下等价于 reduce-to-root。
+pub fn all_reduce_to_cpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    parts: &[TensorBuf],
+    out: &mut TensorBuf,
+    rows: usize,
+    cols: usize,
+) {
+    let len = rows * cols;
+    let TensorBuf::Cpu(out_vec) = out else {
+        panic!("all_reduce_to_cpu 的输出必须是 TensorBuf::Cpu");
+    };
+    out_vec.clear();
+    out_vec.resize(len, 0.0f32);
+
+    for part in parts {
+        match part {
+            TensorBuf::Cpu(v) => {
+                assert_eq!(v.len(), len, "CPU 分片尺寸不符");
+                for (o, &x) in out_vec.iter_mut().zip(v.iter()) {
+                    *o += x;
+                }
+            }
+            TensorBuf::Gpu(buf) => {
+                let v = device_to_host(device, queue, buf, len);
+                for (o, &x) in out_vec.iter_mut().zip(v.iter()) {
+                    *o += x;
+                }
+            }
+        }
+    }
+}
