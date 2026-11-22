@@ -9,3 +9,4 @@ het-comm = { path = "../het-comm" }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 bytemuck = { workspace = true }
+rayon = "1.11.0"

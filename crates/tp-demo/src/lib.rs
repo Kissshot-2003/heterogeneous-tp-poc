@@ -14,7 +14,7 @@ use std::time::Instant;
 use het_comm::{as_gpu, CommDomain, TensorBuf, VulkanComm};
 
 use crate::dense::{dense_matmul, max_abs_error};
-use crate::matmul_cpu::matmul_cpu;
+use crate::matmul_cpu::{matmul_cpu, warmup_matmul_cpu};
 
 /// 默认形状：M=64, K=256, N=128（列切分后每半 64 列）。
 pub const DEFAULT_M: usize = 64;
@@ -395,6 +395,9 @@ pub fn run_poc() -> PocResult {
         TensorBuf::Gpu(_) => unreachable!(),
     };
     let smoke_compute_ok = smoke_compute(&comm);
+
+    // P3：预热 rayon 线程池，使首次启动开销不计入 matmul 计时。
+    warmup_matmul_cpu();
 
     // ===== M3：双路 matmul + 非均匀列切分（P0 重叠 + P2c 非均匀）=====
     let (m, k, n) = (DEFAULT_M, DEFAULT_K, DEFAULT_N);
