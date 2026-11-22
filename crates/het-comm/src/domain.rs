@@ -5,6 +5,7 @@
 
 use crate::{
     collectives::{all_reduce_to_cpu, gather_to_cpu},
+    device_to_device,
     device_to_host,
     host_to_device,
     CommDomain,
@@ -55,9 +56,10 @@ impl CommDomain for VulkanComm {
                 d.clear();
                 d.extend_from_slice(&s[..len]);
             }
-            (TensorBuf::Gpu(_), TensorBuf::Gpu(_)) => {
-                // 本 PoC 不需要 GPU→GPU；留到多卡阶段用 vkCmdCopyBuffer 实现。
-                todo!("M2: GPU→GPU 拷贝不在 1 CPU + 1 GPU 的 PoC 范围")
+            (TensorBuf::Gpu(s), TensorBuf::Gpu(d)) => {
+                // P5：GPU→GPU 拷贝（同一 logical device 内的 buffer 间拷贝）。
+                // 真实多物理卡需回 host staging 中转；本机单卡用独立 buffer 模拟。
+                device_to_device(&self.device, &self.queue, s, d, len);
             }
         }
     }

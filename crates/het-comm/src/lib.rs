@@ -5,11 +5,13 @@
 //!
 //! 里程碑状态见项目根目录 `PLAN.md`。
 
+mod allreduce;
 mod collectives;
 mod device;
 mod domain;
 mod transport;
 
+pub use allreduce::*;
 pub use collectives::*;
 pub use device::*;
 pub use domain::*;

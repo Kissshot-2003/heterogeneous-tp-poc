@@ -5,7 +5,7 @@
 
 use std::sync::Mutex;
 
-use het_comm::{CommDomain, TensorBuf, VulkanComm};
+use het_comm::{make_gpu_buffer, CommDomain, GpuReducer, TensorBuf, VulkanComm};
 use tp_demo::dense::{dense_matmul, max_abs_error};
 use tp_demo::matmul_cpu::matmul_cpu;
 use tp_demo::run_poc;
@@ -108,6 +108,59 @@ fn all_reduce_sums_partials() {
 
     match out {
         TensorBuf::Cpu(v) => assert_eq!(v, vec![11.0, 22.0, 33.0, 44.0]),
+        TensorBuf::Gpu(_) => unreachable!(),
+    }
+}
+
+/// P5：GPU→GPU buffer 拷贝（模拟多设备通信路径）。
+#[test]
+fn gpu_to_gpu_copy() {
+    let _guard = GPU_LOCK.lock().unwrap();
+    let adapter = pollster::block_on(het_comm::request_vulkan_adapter());
+    let comm = pollster::block_on(VulkanComm::new(&adapter));
+
+    let src_vec = vec![1.0f32, 2.0, 3.0, 4.0];
+    let mut src = make_gpu_buffer(&comm.device, src_vec.len());
+    comm.copy(&TensorBuf::Cpu(src_vec.clone()), &mut src, src_vec.len());
+
+    let mut dst = make_gpu_buffer(&comm.device, src_vec.len());
+    comm.copy(&src, &mut dst, src_vec.len()); // GPU→GPU
+
+    let mut back = TensorBuf::Cpu(vec![0.0; src_vec.len()]);
+    comm.copy(&dst, &mut back, src_vec.len());
+    match back {
+        TensorBuf::Cpu(v) => assert_eq!(v, src_vec, "GPU→GPU 拷贝应逐元素相等"),
+        TensorBuf::Gpu(_) => unreachable!(),
+    }
+}
+
+/// P5：GPU 端 all-reduce（pairwise add + broadcast），3 个分片。
+#[test]
+fn gpu_all_reduce_three_parts() {
+    let _guard = GPU_LOCK.lock().unwrap();
+    let adapter = pollster::block_on(het_comm::request_vulkan_adapter());
+    let comm = pollster::block_on(VulkanComm::new(&adapter));
+    let reducer = GpuReducer::new(comm.device.clone(), comm.queue.clone());
+
+    let len = 4usize;
+    let parts_vec = [
+        vec![1.0f32, 2.0, 3.0, 4.0],
+        vec![10.0f32, 20.0, 30.0, 40.0],
+        vec![100.0f32, 200.0, 300.0, 400.0],
+    ];
+    let mut parts: Vec<TensorBuf> = Vec::new();
+    for v in &parts_vec {
+        let mut buf = make_gpu_buffer(&comm.device, len);
+        comm.copy(&TensorBuf::Cpu(v.clone()), &mut buf, len);
+        parts.push(buf);
+    }
+
+    let mut out = TensorBuf::Cpu(Vec::new());
+    reducer.all_reduce(&parts, &mut out, len);
+
+    let expected = vec![111.0f32, 222.0, 333.0, 444.0];
+    match out {
+        TensorBuf::Cpu(v) => assert_eq!(v, expected, "all-reduce 应为各分片逐元素和"),
         TensorBuf::Gpu(_) => unreachable!(),
     }
 }

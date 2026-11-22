@@ -387,11 +387,19 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 **遗留**：all-reduce 目前是 CPU 侧 reduce-to-root；P5 多卡时需实现 GPU→GPU（当前 `copy` 的 GPU→GPU 分支仍是 `todo!()`）和真正的 ring/tree all-reduce。
 
-### P5：多 GPU 与跨厂商
+### P5：多 GPU 通信路径 ✅ 已完成（单卡模拟多设备）
 
-- 用 `ash` 直接管理多个 Vulkan 设备
-- 探索跨厂商 GPU 之间 P2P 是否可用（大概率不可用，需回 host 中转）
-- 实现 `CommDomain::copy` 的 GPU→GPU 分支（当前是 `todo!()`）
+**环境约束**：本机只有 1 张物理 GPU（RX 5700 XT），其余是虚拟显示适配器。因此用**同一 logical device 上的 N 个独立 storage buffer** 模拟 N 个逻辑设备——通信算法、同步、buffer 抽象与真实多卡一致，物理传输走本 device 显存。
+
+实现：
+
+- **`device_to_device`**（`transport.rs`）：GPU→GPU buffer 拷贝，填补了 `CommDomain::copy` 的 GPU→GPU `todo!()` 分支
+- **`GpuReducer`**（`allreduce.rs`）：GPU 端 pairwise add shader（`shaders/reduce_sum.wgsl`），把 N 个部分和逐元素累加，并 **broadcast 回每个 buffer**（all-reduce 语义：所有参与方持有完整和）
+- 测试增至 8 个：新增 `gpu_to_gpu_copy`、`gpu_all_reduce_three_parts`（3 分片相加 111/222/333/444 通过）
+
+**说明**：P4 demo（2 设备）仍用 CPU 侧 reduce-to-root——对 2 设备更高效且已验证正确；`GpuReducer` 的价值在多设备扩展（测试已覆盖 3 分片）。真实跨物理卡时，`device_to_device` 需改为 host staging 中转（跨 device 的 buffer 不能直接拷贝）。
+
+**未做**：跨厂商真实多卡验证（需第二张物理 GPU）、ring/tree 拓扑优化（当前是 pairwise reduce + broadcast）、用 `ash` 管理多 adapter。这些需要真实多卡硬件才能继续。
 
 ---
 

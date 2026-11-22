@@ -49,6 +49,7 @@ max_abs_error     =  0.000e0   # vs dense reference  (< 1e-4 => PASS)
 | P2c 非均匀切分 | ✅ 已尝试，失败：D2H 存在 16KB staging 阈值，GPU>50% 反而慢 8 倍，已回退 50/50 |
 | P3 加速 CPU | ✅ 已完成（纯 Rust 分块 + rayon，未接 oneDNN）：小形状 160→140µs，大形状 25ms→8ms（3 倍） |
 | P4 真 TP + all-reduce | ✅ 已完成（达成初衷）：行并行切分 + 层末 all-reduce，误差 1.19e-6，6 个测试全绿 |
+| P5 多 GPU 通信路径 | ✅ 已完成（单卡模拟）：GPU→GPU copy + GPU 端 all-reduce（3 分片），8 个测试全绿 |
 
 **完整 PoC 已跑通**：`max_abs_error = 0.000e0`（M=64, K=256, N=128）。已 `git init`，基线提交 `836d14f`。
 

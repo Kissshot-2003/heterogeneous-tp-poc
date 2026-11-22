@@ -34,6 +34,27 @@ pub fn host_to_device(queue: &wgpu::Queue, src: &[f32], dst: &wgpu::Buffer) {
     queue.write_buffer(dst, 0, bytemuck::cast_slice(src));
 }
 
+/// GPU→GPU：同一 logical device 内两个 buffer 之间的拷贝（P5）。
+///
+/// 真实多物理卡场景下跨 device 拷贝受 wgpu 限制，需回 host staging 中转；
+/// 本 PoC 用同一 device 上的两个独立 storage buffer 模拟两个逻辑设备，
+/// 其通信算法（ring all-reduce）与真实多卡一致，只是物理路径走本 device 显存。
+pub fn device_to_device(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    len: usize,
+) {
+    let byte_len = (len * std::mem::size_of::<f32>()) as u64;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("het-comm gpu2gpu copy"),
+    });
+    encoder.copy_buffer_to_buffer(src, 0, dst, 0, byte_len);
+    queue.submit(Some(encoder.finish()));
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+}
+
 /// D2H：把 GPU buffer 读回 CPU，返回前 `len` 个 f32。
 ///
 /// WebGPU 规范不允许 `MAP_READ` 与 `STORAGE` 同时存在，因此走 staging buffer：
