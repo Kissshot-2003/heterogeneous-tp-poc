@@ -3,14 +3,21 @@
 //! 把 HANDOVER.md 第 6 节的验收标准变成一键可跑的 `cargo test`，
 //! 防止 P0（异步重叠）等后续改动破坏已验证的正确性。
 
+use std::sync::Mutex;
+
 use het_comm::{CommDomain, TensorBuf, VulkanComm};
 use tp_demo::dense::{dense_matmul, max_abs_error};
 use tp_demo::matmul_cpu::matmul_cpu;
 use tp_demo::run_poc;
 
+/// 多个测试同时请求 Vulkan adapter 时会偶发 NotFound（active_backends=0x0），
+/// 用进程内 Mutex 把需要 GPU 的测试串行化。
+static GPU_LOCK: Mutex<()> = Mutex::new(());
+
 /// 验收标准 1~5 的端到端验证（需要本机有 Vulkan GPU）。
 #[test]
 fn poc_end_to_end() {
+    let _guard = GPU_LOCK.lock().unwrap();
     let r = run_poc();
 
     // 1. 必须走 Vulkan backend（不断言具体型号，保证测试可移植）
@@ -44,6 +51,7 @@ fn poc_end_to_end() {
 /// 这保证 submit → collect 之间确实有 CPU 工作发生（而非串行执行）。
 #[test]
 fn p0_cpu_work_overlaps_gpu_wait() {
+    let _guard = GPU_LOCK.lock().unwrap();
     let r = run_poc();
     assert!(
         r.overlap_saving_us > 0,
@@ -64,6 +72,7 @@ fn p0_cpu_work_overlaps_gpu_wait() {
 /// 若有人把 gather 改回整块拼接，这个测试会立刻失败（误差达 3.9）。
 #[test]
 fn gather_is_row_interleaved() {
+    let _guard = GPU_LOCK.lock().unwrap();
     let adapter = pollster::block_on(het_comm::request_vulkan_adapter());
     let comm = pollster::block_on(VulkanComm::new(&adapter));
 

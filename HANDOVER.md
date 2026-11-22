@@ -280,16 +280,19 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 
 **踩坑**：collect 前的显式 `barrier()` 不能省——见坑 5。
 
-### P1：GPU shader 优化
+### P1：GPU shader 优化 ✅ 已完成（收益有限）
 
-- workgroup size 从 8×8 调到 16×16 或 32×8
-- 用 shared memory 做 tiling，减少全局内存读取
-- 目标：GPU matmul 稳态低于 CPU 的 164~205µs（当前稳态 277~323µs，冷启动可达 1107µs，见第 8 节）
+- 已实现 16×16 shared memory tiling（`matmul.wgsl`），dispatch 改为 `(M+15)/16`
+- **GPU 执行**：392µs → ~312µs（约 20% 改善）
+- **端到端无收益**：tiling shader 的 naga 编译 / pipeline 创建更慢，抵消了执行收益（GPU 阶段不含编译，total 包含）
+- **TILE 对比**：实测 TILE=16 优于 TILE=8（barrier 次数减半），已固定 16
+- **大形状验证（M=256,K=512,N=512）**：GPU 仍慢于 CPU（~3900µs vs ~3100µs），RX 5700 XT + 朴素 shader 难超越现代 CPU 的 naive matmul；但异构端到端 4800µs < 纯 CPU 全量 6200µs（P0 重叠收益在大规模下依然成立）
 
-### P2：更大形状测试
+### P2：更大形状 / 更优 shader（合并推进）
 
-- 试 M=512, K=1024, N=1024，看趋势是否逆转（GPU 在大规模下才有优势）
-- 注意 buffer 大小和 workgroup 数量
+- 当前形状（64×256×128）太小，shader 编译开销主导端到端时间，优化执行收益不可见
+- 真实推理引擎里 shader 编译一次后复用，P1 的 tiling 才有意义；本 PoC 每次 `cargo run` 重编译，掩盖了收益
+- 若要继续：试 cuBLAS 级优化 / 用 wgpu timestamp query 分离纯 GPU 时间 / 或换更大形状做长期 benchmark
 
 ### P3：接入 oneDNN
 

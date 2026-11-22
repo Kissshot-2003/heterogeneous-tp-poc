@@ -151,8 +151,9 @@ pub fn gpu_matmul_submit(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        // 保守取整：@workgroup_size(8,8)
-        pass.dispatch_workgroups(((m + 7) / 8) as u32, ((n2 + 7) / 8) as u32, 1);
+        // P1：@workgroup_size(16,16) + 16×16 shared memory tile。
+        // 实测 TILE=16 优于 TILE=8（barrier 次数减半），故固定为 16。
+        pass.dispatch_workgroups(((m + 15) / 16) as u32, ((n2 + 15) / 16) as u32, 1);
     }
     comm.queue.submit(Some(encoder.finish()));
 
