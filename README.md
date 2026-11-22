@@ -1,0 +1,55 @@
+# 异构张量并行 PoC（1 CPU + 1 Vulkan GPU）
+
+最小工具化验证：建立跨 CPU / Vulkan GPU 的统一通信域，跑通一次真实的张量并行切分。
+
+## 一句话目标
+
+把一次矩阵乘法 `[M,K] × [K,N]` 按列切成两半：**CPU 算左半、GPU 算右半**，再把结果汇总回 CPU，与 dense 参考逐元素比对，并输出分阶段耗时。
+
+## 快速开始
+
+```powershell
+cd C:\通用工程\10_heterogeneous-tp-poc
+cargo run -p tp-demo --release
+```
+
+预期输出（示意）：
+
+```
+Adapter: AMD Radeon RX 5700 XT (Vulkan)
+dims: M=64 K=256 N=128
+cpu_matmul_us    =  ...
+h2d_transfer_us  =  ...   # A, B1 上传
+gpu_matmul_us    =  ...
+d2h_transfer_us  =  ...   # C1 回传
+total_us         =  ...
+max_abs_error    =  ...   # vs dense reference  (< 1e-4 => PASS)
+```
+
+## 当前状态
+
+| 里程碑 | 状态 |
+|--------|------|
+| M1 环境验证（wgpu 枚举 Vulkan 设备） | ✅ 已通过 |
+| M2 统一 buffer + H2D/D2H 传输 + smoke compute pass | ✅ 已通过 |
+| M3 CPU/GPU 双路 matmul + 列切分合并 | ✅ 已通过 |
+| M4 数值比对 + 计时报告 | ✅ 已通过 |
+
+**完整 PoC 已跑通**：`max_abs_error = 0.000e0`（M=64, K=256, N=128）。
+
+> 注意：`total_us` 包含 shader 编译、pipeline/buffer 创建等一次性初始化开销，因此大于各阶段之和；PoC 阶段只验证可行性，未做预热与性能优化。
+
+## 文档
+
+- [HANDOVER.md](HANDOVER.md) — **交接文档**（接手人先读这个：架构、踩坑、性能解读、下一步路线）
+- [PLAN.md](PLAN.md) — 完整项目方案（目标、架构、API、里程碑、验收标准、风险）
+- [crates/het-comm](crates/het-comm) — 统一通信域 crate
+- [crates/tp-demo](crates/tp-demo) — 张量并行验证程序
+
+## 相关 upstream 工作
+
+- [Candle #3828 张量并行跟踪卡](../07_开源共建/upstream-contributions/candle-tensor-parallel/STATUS.md) —— 向 `huggingface/candle` 贡献可复用的 `ColumnParallelLinear` / `RowParallelLinear`。本 PoC 是**自研验证**（CPU + Vulkan GPU），#3828 是**上游组件化**（多设备张量并行层），两者可互相借鉴实现，但互不依赖。
+
+## 为什么用 Rust + wgpu
+
+本机没有 C++ 编译器、没有 Vulkan SDK（`glslc` 缺失），但 Rust 工具链完整，`wgpu`/`naga`/`pollster`/`bytemuck` 已在本地 cargo 缓存。wgpu 用 WGSL 由 naga 编译成 SPIR-V，**完全不需要 Vulkan SDK**，且能锁定 Vulkan backend 直接操作 AMD GPU。详见 PLAN.md 第 3 节。
