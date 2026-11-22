@@ -32,10 +32,16 @@ pub trait CommDomain {
     /// 实现内部自动判断 H2D / D2H / CPU→CPU。
     fn copy(&self, src: &TensorBuf, dst: &mut TensorBuf, len: usize);
 
-    /// 把 GPU 分片收集到 CPU 输出。
-    /// `parts` 为各设备分片（行主序的 `rows × cols`）；
-    /// `out` 为拼接后的 CPU 输出。本 PoC 只有 1 个 GPU 分片。
-    fn gather_to_cpu(&self, parts: &[TensorBuf], out: &mut TensorBuf, rows: usize, cols: usize);
+    /// 把各设备分片按行交错收集到 CPU 输出（支持不等宽分片）。
+    /// `parts` 为各设备分片（行主序的 `rows × widths[i]`）；
+    /// `out` 为拼接后的 CPU 输出，宽度为 `sum(widths)`。
+    fn gather_to_cpu(
+        &self,
+        parts: &[TensorBuf],
+        out: &mut TensorBuf,
+        rows: usize,
+        widths: &[usize],
+    );
 
     /// 等待所有在途工作完成。PoC 阶段用阻塞等待，正确性优先。
     fn barrier(&self);

@@ -62,8 +62,14 @@ impl CommDomain for VulkanComm {
         }
     }
 
-    fn gather_to_cpu(&self, parts: &[TensorBuf], out: &mut TensorBuf, rows: usize, cols: usize) {
-        gather_to_cpu(&self.device, &self.queue, parts, out, rows, cols)
+    fn gather_to_cpu(
+        &self,
+        parts: &[TensorBuf],
+        out: &mut TensorBuf,
+        rows: usize,
+        widths: &[usize],
+    ) {
+        gather_to_cpu(&self.device, &self.queue, parts, out, rows, widths)
     }
 
     fn barrier(&self) {

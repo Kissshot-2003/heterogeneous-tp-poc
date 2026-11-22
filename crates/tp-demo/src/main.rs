@@ -23,8 +23,13 @@ fn main() {
 
     println!("\n=== 结果（P0：CPU 与 GPU 重叠）===");
     println!(
-        "dims: M={} K={} N={} (每半 {} 列)",
-        DEFAULT_M, DEFAULT_K, DEFAULT_N, DEFAULT_N / 2
+        "dims: M={} K={} N={} | 非均匀切分: CPU={} 列 / GPU={} 列 ({:.0}%)",
+        DEFAULT_M,
+        DEFAULT_K,
+        DEFAULT_N,
+        r.cpu_cols,
+        r.gpu_cols,
+        r.gpu_cols as f64 / DEFAULT_N as f64 * 100.0
     );
     println!("h2d_submit_us    = {}", r.h2d_submit_us);
     println!(

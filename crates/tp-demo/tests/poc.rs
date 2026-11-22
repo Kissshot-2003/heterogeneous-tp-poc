@@ -82,7 +82,7 @@ fn gather_is_row_interleaved() {
         TensorBuf::Cpu(vec![5.0, 6.0, 7.0, 8.0]),
     ];
     let mut out = TensorBuf::Cpu(Vec::new());
-    comm.gather_to_cpu(&parts, &mut out, 2, 2);
+    comm.gather_to_cpu(&parts, &mut out, 2, &[2, 2]);
 
     // 期望按行交错：[C0行0, C1行0, C0行1, C1行1]
     let expected = vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0];

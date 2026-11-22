@@ -21,6 +21,14 @@ pub const DEFAULT_M: usize = 64;
 pub const DEFAULT_K: usize = 256;
 pub const DEFAULT_N: usize = 128;
 
+/// P2c：GPU 承担的列比例。
+///
+/// 理论最优约 0.62（按算力比例），但实测发现 wgpu/Vulkan 的 D2H 存在
+/// **16KB staging buffer 快路径阈值**：C1 超过 16KB（gpu_cols > 64）时
+/// map 耗时从 ~40µs 暴涨到 ~300µs。因此本机保持 0.5（C1=16KB）反而最快。
+/// 详细数据与尝试见 HANDOVER.md 第 9 节 P2c。
+pub const GPU_COL_FRACTION: f64 = 0.5;
+
 /// 一次 PoC 运行的完整结果，供打印与测试断言共用。
 #[derive(Debug, Clone)]
 pub struct PocResult {
@@ -46,6 +54,9 @@ pub struct PocResult {
     pub total_us: u128,
     /// 重叠节省的时间：CPU 计算被 GPU 等待覆盖的部分
     pub overlap_saving_us: u128,
+    /// P2c：非均匀切分的列数（CPU / GPU）
+    pub cpu_cols: usize,
+    pub gpu_cols: usize,
 }
 
 /// 已提交到 GPU、等待取回的 matmul 任务。
@@ -385,10 +396,11 @@ pub fn run_poc() -> PocResult {
     };
     let smoke_compute_ok = smoke_compute(&comm);
 
-    // ===== M3：双路 matmul + 列切分合并（P0：CPU/GPU 重叠）=====
+    // ===== M3：双路 matmul + 非均匀列切分（P0 重叠 + P2c 非均匀）=====
     let (m, k, n) = (DEFAULT_M, DEFAULT_K, DEFAULT_N);
-    let n2 = n / 2;
-    assert_eq!(n % 2, 0, "N 必须能被 2 整除");
+    let gpu_cols = (n as f64 * GPU_COL_FRACTION) as usize;
+    let cpu_cols = n - gpu_cols;
+    assert!(cpu_cols > 0 && gpu_cols > 0, "切分比例必须为正");
 
     // 确定性伪随机输入，范围 [-0.5, 0.5]。
     let a: Vec<f32> = (0..m * k)
@@ -398,25 +410,27 @@ pub fn run_poc() -> PocResult {
         .map(|i| ((i * 31 % 89) as f32) / 89.0 - 0.5)
         .collect();
 
-    // B 按列切成 B0 [K, N/2] 与 B1 [K, N/2]。
-    let mut b0 = Vec::with_capacity(k * n2);
-    let mut b1 = Vec::with_capacity(k * n2);
+    // P2c：B 按非均匀列切成 B0 [K, cpu_cols]（CPU）与 B1 [K, gpu_cols]（GPU）。
+    let mut b0 = Vec::with_capacity(k * cpu_cols);
+    let mut b1 = Vec::with_capacity(k * gpu_cols);
     for t in 0..k {
-        for j in 0..n2 {
+        for j in 0..cpu_cols {
             b0.push(b[t * n + j]);
-            b1.push(b[t * n + n2 + j]);
+        }
+        for j in 0..gpu_cols {
+            b1.push(b[t * n + cpu_cols + j]);
         }
     }
 
     let total_start = Instant::now();
 
     // 1) 提交 GPU（H2D + compute），立即返回。
-    let (pending, h2d_us) = gpu_matmul_submit(&comm, &a, &b1, m, k, n2);
+    let (pending, h2d_us) = gpu_matmul_submit(&comm, &a, &b1, m, k, gpu_cols);
     let gpu_wall_start = Instant::now();
 
     // 2) CPU 算左半 C0 —— 与 GPU 执行重叠。
     let t = Instant::now();
-    let c0 = matmul_cpu(&a, &b0, m, k, n2);
+    let c0 = matmul_cpu(&a, &b0, m, k, cpu_cols);
     let cpu_us = t.elapsed().as_micros();
 
     // 3) 直接取回（P2b：compute + D2H copy 已合并为同一次 submit，无需 barrier）。
@@ -428,7 +442,7 @@ pub fn run_poc() -> PocResult {
     // 4) Gather：按行交错拼成完整 [M, N]（见 HANDOVER.md 坑 3）。
     let parts = [TensorBuf::Cpu(c0), TensorBuf::Cpu(c1)];
     let mut gathered = TensorBuf::Cpu(Vec::with_capacity(m * n));
-    comm.gather_to_cpu(&parts, &mut gathered, m, n2);
+    comm.gather_to_cpu(&parts, &mut gathered, m, &[cpu_cols, gpu_cols]);
     let total_us = total_start.elapsed().as_micros();
     let got = match gathered {
         TensorBuf::Cpu(v) => v,
@@ -458,5 +472,7 @@ pub fn run_poc() -> PocResult {
         d2h_transfer_us: d2h_us,
         total_us,
         overlap_saving_us,
+        cpu_cols,
+        gpu_cols,
     }
 }
