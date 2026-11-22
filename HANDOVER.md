@@ -1,7 +1,7 @@
 # 异构张量并行 PoC —— 交接文档
 
 > 交接日期：2026-11-22
-> 项目路径：`C:\通用工程\10_heterogeneous-tp-poc`
+> 项目路径：仓库根目录（`heterogeneous-tp-poc`）
 > 状态：**PoC 四个里程碑全部完成，4 个集成测试全绿，git 已初始化并有基线提交**
 
 ---
@@ -133,7 +133,7 @@
 ### 6.1 跑 Demo
 
 ```powershell
-cd C:\通用工程\10_heterogeneous-tp-poc
+cd heterogeneous-tp-poc
 cargo run --offline -p tp-demo --release
 ```
 
