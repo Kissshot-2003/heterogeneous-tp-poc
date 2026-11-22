@@ -53,7 +53,9 @@ pub struct PocResult {
 /// 只需持有 C1 的 GPU buffer：其余 buffer / pipeline / bind group 在 submit 后
 /// 由 wgpu 内部保持存活直到命令完成，Rust 侧 drop 不会取消已提交的工作。
 pub struct PendingGpuMatmul {
-    c_buf: TensorBuf,
+    /// P2b：compute 完成后，C1 已被同一次 submit  copy 到这里，collect 只需 map。
+    c1_staging: wgpu::Buffer,
+    len: usize,
     /// P2 timestamp 测量的待读取句柄；设备不支持时为 None
     timestamp: Option<TimestampGuard>,
 }
@@ -203,34 +205,60 @@ pub fn gpu_matmul_submit(
     if let Some(g) = &timestamp {
         encoder.resolve_query_set(&g._query_set, 0..2, &g.resolve_buf, 0);
     }
+
+    // P2b：把 D2H staging copy 也塞进同一次 submit。
+    // GPU 顺序执行 compute → copy，CPU 在 submit 后并行算 C0；
+    // collect 时只需 map staging，省掉一次 submit 和一次 barrier poll。
+    let c1_staging = comm.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("c1 d2h staging"),
+        size: (m * n2 * std::mem::size_of::<f32>()) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(
+        as_gpu(&c_buf).expect("C1 必须是 GPU buffer"),
+        0,
+        &c1_staging,
+        0,
+        (m * n2 * 4) as u64,
+    );
     comm.queue.submit(Some(encoder.finish()));
 
     (
         PendingGpuMatmul {
-            c_buf,
+            c1_staging,
+            len: m * n2,
             timestamp,
         },
         h2d_us,
     )
 }
 
-/// 取回阶段：D2H 读回 C1，并原样返回 timestamp 句柄供后续读取。
+/// 取回阶段：从已 copy 好的 staging buffer 直接 map 读回 C1。
 ///
-/// `device_to_host` 内部会 submit 一个 staging copy 并 `poll(wait_indefinitely)`，
-/// 因此会自动等待先前提交的 compute 完成——无需显式 barrier。
+/// P2b：staging copy 已在 submit 时与 compute 合并提交，这里只做 map+poll+read，
+/// 不再 submit、不再 create_buffer——省掉一次 submit 和一次显式 barrier。
 pub fn gpu_matmul_collect(
     comm: &VulkanComm,
     pending: PendingGpuMatmul,
-    len: usize,
 ) -> (Vec<f32>, u128, Option<TimestampGuard>) {
     let t = Instant::now();
-    let mut c1_buf = TensorBuf::Cpu(vec![0.0; len]);
-    comm.copy(&pending.c_buf, &mut c1_buf, len);
+
+    pending
+        .c1_staging
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |_| {});
+    let _ = comm.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let view = pending
+        .c1_staging
+        .get_mapped_range(..)
+        .expect("C1 staging 映射失败");
+    let c1 = bytemuck::cast_slice::<u8, f32>(&view[..])[..pending.len].to_vec();
+    drop(view);
+    pending.c1_staging.unmap();
+
     let d2h_us = t.elapsed().as_micros();
-    let c1 = match c1_buf {
-        TensorBuf::Cpu(v) => v,
-        TensorBuf::Gpu(_) => unreachable!(),
-    };
     (c1, d2h_us, pending.timestamp)
 }
 
@@ -391,13 +419,8 @@ pub fn run_poc() -> PocResult {
     let c0 = matmul_cpu(&a, &b0, m, k, n2);
     let cpu_us = t.elapsed().as_micros();
 
-    // 3) 显式等待 GPU compute 完成（CPU 已与之重叠），再取回结果。
-    //
-    //    注意：不能省掉这个 barrier。实测若让 device_to_host 内部的
-    //    map_async + poll 直接等待在途 compute，D2H 会出现 ~1.7ms 的异常延迟
-    //    （wgpu Vulkan 后端行为）。先 barrier 再 collect，D2H 回落到 ~150µs。
-    comm.barrier();
-    let (c1, d2h_us, ts_guard) = gpu_matmul_collect(&comm, pending, m * n2);
+    // 3) 直接取回（P2b：compute + D2H copy 已合并为同一次 submit，无需 barrier）。
+    let (c1, d2h_us, ts_guard) = gpu_matmul_collect(&comm, pending);
     // 先测 GPU 墙钟，再读 timestamp（读回本身会产生额外 submit/poll）
     let gpu_wall_us = gpu_wall_start.elapsed().as_micros();
     let gpu_compute_us = read_gpu_timestamps(&comm, ts_guard);

@@ -45,6 +45,7 @@ max_abs_error     =  0.000e0   # vs dense reference  (< 1e-4 => PASS)
 | P0 CPU/GPU 异步重叠 | ✅ 已完成，典型收益 23%（1011µs → 780µs） |
 | P1 shared memory tiling | ✅ 已完成，GPU 执行改善 20% 但端到端不可见 |
 | P2 timestamp query | ✅ 已完成，**纯 GPU 计算仅 34µs，88% 墙钟是提交/同步开销** |
+| P2b 合并 submit | ✅ 已完成，D2H 140µs→42µs；**新瓶颈：CPU matmul 成关键路径** |
 
 **完整 PoC 已跑通**：`max_abs_error = 0.000e0`（M=64, K=256, N=128）。已 `git init`，基线提交 `836d14f`。
 

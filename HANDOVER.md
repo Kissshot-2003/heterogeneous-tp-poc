@@ -257,7 +257,7 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 | **纯 GPU compute（timestamp）** | **34µs（8 次完全一致）** |
 | GPU 阶段墙钟（submit→collect） | 289~474µs（偶发抖动到 8.7ms） |
 | CPU matmul | 161~582µs |
-| 提交/同步开销（wall − compute） | **约 266µs，占墙钟 88%** |
+| 提交/同步开销（P2 时 wall − compute） | ~266µs，占墙钟 88%（**P2b 已降至 ~202µs**） |
 
 **这解释了此前所有现象**：
 
@@ -265,7 +265,20 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 - GPU 本身比 CPU 快 **5~10 倍**（34µs vs 161~582µs）——异构计算的算力优势是真实存在的。
 - **真正的瓶颈不是 shader，而是 wgpu/Vulkan 的提交与同步开销**：`queue.write_buffer` × 3、`queue.submit`、`device.poll(wait_indefinitely)` 用于 barrier、staging buffer 的 map/unmap——这些固定成本约 266µs，完全吞噬了 GPU 的速度优势。
 
-**优化方向随之改变**：继续调 tiling 是盲调；应减少 submit / poll / buffer 创建次数（批处理、复用 staging buffer、避免显式 barrier），或用更轻量的同步原语。
+**优化方向随之改变**：继续调 tiling 是盲调；应减少 submit / poll / buffer 创建次数（批处理、复用 staging buffer、避免显式 barrier），或用更轻量的同步原语。见下面 P2b。
+
+### P2b：合并 submit，开销下降但 CPU 成为新瓶颈 ✅ 已完成
+
+把 compute + timestamp resolve + **D2H staging copy** 塞进同一次 submit，collect 只做 map+poll+read，省掉一次 submit 和显式 barrier（坑 5 的 1.7ms 延迟也随之规避）。8 次采样：
+
+| 指标 | P2（分开 submit） | P2b（合并 submit） |
+|------|------------------|-------------------|
+| D2H 读回 | ~140µs | **~42µs** |
+| GPU 墙钟 | ~300µs | **~236µs** |
+| 纯 GPU compute | 34µs | 34µs |
+| 提交/同步开销 | ~266µs | ~202µs |
+
+**新瓶颈**：GPU 墙钟 ≈ CPU 时间（160µs）+ D2H（42µs），即 **CPU matmul 已成为关键路径**——GPU 34µs 的计算被 CPU 160µs 完全盖住。再优化 GPU 同步收益有限，下一步要么加速 CPU（P3 oneDNN），要么按 HeteGen 思路做**非均匀切分**（GPU 能力强就多分给它，让 CPU 少算）。
 
 解读：
 
@@ -313,12 +326,17 @@ P0 初版省掉了 collect 前的显式 `barrier()`，想让 `device_to_host` �
 - compute pass 写入起止 timestamp，resolve 后读回，`gpu_compute_us` 进入 `PocResult`
 - **结论**：纯 GPU 计算仅 34µs，提交/同步开销 ~266µs 占墙钟 88%——瓶颈转移，后续优化应针对提交/同步而非 shader
 
-### P2b：减少提交与同步开销（新的最高优先级）
+### P2b：减少提交与同步开销 ✅ 已完成（见上文）
 
-- 复用 staging buffer，避免每次 D2H 都 `create_buffer`
-- 合并 H2D / compute / D2H 到更少的 submit，或探索 callback/event 替代 `poll(wait_indefinitely)`
-- 目标：把 ~266µs 固定开销压下来，让 34µs 的 GPU 优势真正体现在端到端
-- 注意坑 5：省掉 barrier 会触发 `map_async + poll` 的 ~1.7ms 异常延迟，需要在减少 submit 的同时规避它
+- 已合并 compute + D2H copy 到同一次 submit；开销 266µs → 202µs，D2H 140µs → 42µs
+- 坑 5 的 1.7ms 延迟在合并 submit 后不再复现
+- 剩余可选项：复用 H2D 的 staging / 进一步探索 callback 同步（收益已递减）
+
+### P2c：非均匀切分（新的最高优先级之一）
+
+- GPU 34µs vs CPU 160µs，当前 50/50 列切分让 CPU 成为关键路径
+- 按 HeteGen 思路把更大比例的工作分给 GPU（如 GPU 70% / CPU 30%），让两侧完成时间趋近 `T_CPU ≈ T_GPU + T_COM`
+- 与 P3（oneDNN 加速 CPU）二选一或组合推进
 
 ### P3：接入 oneDNN
 
